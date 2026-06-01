@@ -12,9 +12,9 @@ REPO_ROOT = Path(__file__).resolve().parent
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 
 FILES = [
-    "books_v0_deduped.parquet",
-    "embeddings_minilm_v0_deduped.npy",
-    "faiss_minilm_v0_deduped.index",
+    "books_v1.parquet",
+    "embeddings_minilm_v1.npy",
+    "faiss_minilm_v1.index",
     "my_matched_ratings.json",
 ]
 
