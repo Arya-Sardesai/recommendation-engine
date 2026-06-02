@@ -17,6 +17,13 @@ print("Loading corpus...")
 df = pd.read_parquet(PROCESSED / "books_v1.parquet")
 print(f"  {len(df):,} books total")
 
+# Skip already-tagged books
+MASTER_TAGS = PROCESSED / "book_tags.parquet"
+if MASTER_TAGS.exists():
+    already_tagged = set(pd.read_parquet(MASTER_TAGS)["book_id"].astype(str))
+    print(f"  {len(already_tagged):,} books already tagged, will skip")
+    df = df[~df["book_id"].astype(str).isin(already_tagged)]
+
 # Filter: must have a description (tags need it), must be recommendable
 candidates = df[
     (df["description"].notna()) &
