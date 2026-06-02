@@ -157,6 +157,60 @@ def _tool_search_catalog(state, query, limit=5):
                          "year": int(r["publication_year"]) if pd.notna(r["publication_year"]) else None}
                         for _, r in hits.iterrows()]}
 
+def _tool_search_catalog_semantic(state, query, limit=15, min_year=None, max_year=None):
+    """Semantic search across the ENTIRE catalog (not anchored to user ratings).
+    Use when the user asks for a genre/vibe outside their rated taste — combine
+    the requested genre with qualities you've inferred from their taste."""
+    df = state["df"]
+    embeddings = state["embeddings"]
+    index = state["index"]
+    ratings = state["ratings"]
+
+    model = _get_query_embedder(state)
+    qvec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+
+    # search a wider net so we can filter by year/popularity and still have enough
+    sims, idxs = index.search(qvec, 200)
+
+    rated_ids = {r["book_id"] for r in ratings}
+    rated_authors = {r.get("matched_author", "").lower() for r in ratings if r.get("matched_author")}
+
+    results = []
+    seen_works = set()
+    for s, ix in zip(sims[0], idxs[0]):
+        b = df.iloc[ix]
+        if b["book_id"] in rated_ids:
+            continue
+        if b["primary_author"].lower() in rated_authors:
+            continue
+        if b["ratings_count"] < 2000:
+            continue
+        w = b["work_id"]
+        if w and w in seen_works:
+            continue
+        if w:
+            seen_works.add(w)
+        yr = b["publication_year"]
+        if min_year is not None and (pd.isna(yr) or yr < min_year):
+            continue
+        if max_year is not None and (pd.isna(yr) or yr > max_year):
+            continue
+        results.append({
+            "title": b["title"],
+            "author": b["primary_author"],
+            "year": int(yr) if pd.notna(yr) else None,
+            "genres": list(b["genres"]) if b["genres"] is not None else [],
+            "relevance": round(float(s), 3),
+        })
+        if len(results) >= limit:
+            break
+
+    return {
+        "query": query,
+        "results": results,
+        "note": "Catalog-wide semantic results. Use these when the user asks for a genre outside their rated taste."
+    }
+
 
 # tool schemas exposed to Claude
 TOOLS = [
@@ -197,26 +251,59 @@ TOOLS = [
             "required": ["query"],
         },
     },
+        {
+    "name": "search_catalog_semantic",
+    "description": "Semantic search across the ENTIRE catalog by free-text query (genre + qualities). Use this when the user asks for a genre they haven't rated in (e.g. they ask for cyberpunk but their ratings are all literary fiction). The right pattern: first look at their ratings to infer qualities they enjoy (twists, character-driven, witty, fast-paced, etc.), then call this with a query combining the requested genre AND those qualities — e.g. 'cyberpunk with literary depth and character focus'. Excludes books they've rated and authors they've read.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Free-text query combining the requested genre with qualities from the user's taste. e.g. 'cyberpunk with twists and witty dialogue'."},
+            "limit": {"type": "integer", "description": "How many results to return (default 15)."},
+            "min_year": {"type": "integer"},
+            "max_year": {"type": "integer"},
+        },
+        "required": ["query"],},
+    }
 ]
 
 TOOL_IMPLS = {
     "search_user_ratings": _tool_search_user_ratings,
     "get_recommendations": _tool_get_recommendations,
     "search_catalog": _tool_search_catalog,
+    "search_catalog_semantic": _tool_search_catalog_semantic,
 }
 
 SYSTEM_PROMPT = """You are a thoughtful book recommendation assistant. You help the user find books to read based on their taste and their requests.
 
-You have tools to inspect the user's ratings (with semantic search), get recommendations from anchor books, and search the catalog.
+You have four tools:
+- search_user_ratings: inspect what the user has rated, with optional semantic query
+- get_recommendations: find books similar to anchor books they've rated (best when their taste matches the request)
+- search_catalog: look up a specific title
+- search_catalog_semantic: search the WHOLE catalog by free-text (genre + qualities), use when the user asks for something outside their rated taste
 
-When the user makes a request like "something like my noir books but lighter":
-1. Use search_user_ratings WITH a query (e.g. "noir crime") to find which of their rated books fit the description. The search is semantic, so describe the vibe.
-2. Use get_recommendations with those matched books as anchors, applying year filters if they ask for recent/older.
-3. When they ask for a mood shift ("lighter", "darker", "faster-paced"), you cannot filter on mood directly — instead, use your judgment to pick which returned recommendations best fit the mood, and explain your choices.
+Decide which path the request needs:
 
-Always explain WHY you're recommending each book, referencing the user's taste. Be concise and warm. If you can't find good matches, say so honestly rather than forcing weak recommendations.
+**Path A — request fits their taste** (e.g. "more like my noir books", "something recent like the literary fiction I enjoy"):
+1. search_user_ratings WITH a query to find which rated books fit the description.
+2. get_recommendations with those matched books as anchors.
+3. Explain why each pick fits.
 
-The catalog is books only, and mostly covers titles up to 2025. It does not include films or TV."""
+**Path B — request is OUTSIDE their rated taste** (e.g. they ask for cyberpunk/horror/romance but their ratings are mostly literary fiction):
+1. search_user_ratings WITHOUT a query to see the full taste picture.
+2. Identify 2-3 qualities the user reliably enjoys (twists, character-driven, witty, fast-paced, dark humor, immersive worldbuilding, literary prose, etc.). Reference specific books they've rated highly.
+3. Call search_catalog_semantic with a query that combines the requested genre + those qualities. e.g. "cyberpunk character-driven with literary depth" or "western with dark humor and twists".
+4. Present the picks by EXPLICITLY BRIDGING: "You rated [book] highly for [quality] — here's a cyberpunk novel with that same [quality]." This is the value-add: don't just dump genre results, show the user why these specific picks fit them.
+
+CRITICAL: Never recommend books the user has already rated. Their ratings are visible via search_user_ratings — those are books they've read. Recommendations must always be NEW books from the catalog. 
+If you're tempted to suggest a book they've rated, that's a sign you haven't actually searched for fresh recommendations yet.
+When a user asks for "something to read" (short, long, fun, dark, etc.) without specifying genre, treat it as Path B — use their ratings to infer qualities, then search_catalog_semantic for fresh unread books matching those qualities + the constraint they gave.
+Only recommend books that appear in your tool results. If you have an idea for a book but haven't seen it returned by search_catalog or search_catalog_semantic, verify it with search_catalog first before mentioning it. Never recommend from memory alone.
+
+Other guidance:
+- For mood shifts ("lighter", "darker", "faster-paced") that the tools can't filter directly, use judgment to pick from results and explain.
+- Be concise and warm. Reference the user's taste in your explanations.
+- If recommendations would be weak, say so honestly rather than forcing them.
+- The catalog is books only (no film/TV), up to 2025."""
 
 
 def run_agent(user_message, state, conversation_history=None, max_turns=6, verbose=True):
