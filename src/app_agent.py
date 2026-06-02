@@ -91,6 +91,7 @@ def load_sample():
 def clear_all():
     st.session_state.ratings = []
     st.session_state.chat = []
+    st.session_state.agent_history = []
 
 
 df, embeddings, index = load_all()
@@ -99,6 +100,8 @@ if "ratings" not in st.session_state:
     st.session_state.ratings = []
 if "chat" not in st.session_state:
     st.session_state.chat = []  # list of {"role","content"} for display
+if "agent_history" not in st.session_state:
+    st.session_state.agent_history = []  # full message history for the agent (multi-turn memory)
 
 st.title("Recommendation Engine")
 st.caption(f"{len(df):,} books · rate books on the left, ask the agent on the right")
@@ -167,7 +170,11 @@ with right:
                     state = {"df": df, "embeddings": embeddings, "index": index,
                              "ratings": st.session_state.ratings}
                     try:
-                        reply, _ = run_agent(prompt, state, verbose=False)
+                        reply, st.session_state.agent_history = run_agent(
+                            prompt, state,
+                            conversation_history=st.session_state.agent_history,
+                            verbose=False,
+                        )
                     except Exception as e:
                         reply = f"Something went wrong: {e}"
                 st.markdown(reply)
