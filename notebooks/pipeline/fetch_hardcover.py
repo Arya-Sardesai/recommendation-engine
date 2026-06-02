@@ -25,7 +25,7 @@ ENDPOINT = "https://api.hardcover.app/v1/graphql"
 HEADERS = {"authorization": TOKEN, "Content-Type": "application/json"}
 
 # config
-TARGET = 10_000            # how many books to fetch
+TARGET = 25_000            # how many books to fetch
 PAGE_SIZE = 50             # books per request
 DELAY = 0.6               # seconds between requests (polite)
 MIN_DELAY_ON_ERROR = 5     # backoff base on error

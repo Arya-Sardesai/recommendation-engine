@@ -113,6 +113,8 @@ def main():
                 continue
             if not looks_english(norm["description"]):
                 continue
+            if norm["publication_year"] and norm["publication_year"] > 2025:
+                continue
             hc_rows.append(norm)
     hc = pd.DataFrame(hc_rows)
     print(f"  {len(hc):,} Hardcover books after filters")
