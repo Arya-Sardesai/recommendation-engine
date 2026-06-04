@@ -10,7 +10,7 @@ PROCESSED = Path("data/processed")
 MASTER = PROCESSED / "book_tags.parquet"
 
 # Path to the batch CSV you just got from chat
-BATCH = Path("data/processed/book_tagged_batch_050.csv")  # adjust per batch
+BATCH = Path("data/processed/book_tagged_batch_060.csv")  # adjust per batch
 
 print(f"Loading batch: {BATCH.name}")
 new_batch = pd.read_csv(BATCH)

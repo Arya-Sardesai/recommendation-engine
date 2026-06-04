@@ -211,6 +211,89 @@ def _tool_search_catalog_semantic(state, query, limit=15, min_year=None, max_yea
         "note": "Catalog-wide semantic results. Use these when the user asks for a genre outside their rated taste."
     }
 
+def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15, min_year=None, max_year=None):
+    """Search the tagged subset by quality-tags. Returns books scoring high on positive
+    tags and low on negative tags. Only works for the ~5K books that have been tagged."""
+    df = state["df"]
+    ratings = state["ratings"]
+    
+    # Lazy-load the tags dataframe on first call
+    if "tags_df" not in state:
+        from pathlib import Path
+        tags_path = Path("data/processed/book_tags.parquet")
+        if not tags_path.exists():
+            return {"results": [], "note": "No tag data available."}
+        tdf = pd.read_parquet(tags_path)
+        # Pivot to wide: rows=book_id, cols=tag, values=score
+        state["tags_df"] = tdf.pivot_table(
+            index="book_id", columns="tag", values="score", fill_value=0.0
+        )
+    tags_df = state["tags_df"]
+    
+    positive_tags = positive_tags or []
+    negative_tags = negative_tags or []
+    
+    # Validate tags exist
+    available = set(tags_df.columns)
+    pos = [t for t in positive_tags if t in available]
+    neg = [t for t in negative_tags if t in available]
+    invalid = [t for t in positive_tags + negative_tags if t not in available]
+    
+    if not pos and not neg:
+        return {"results": [], "note": f"None of those tags exist. Available tags include: {sorted(available)[:30]}..."}
+    
+    # Score: sum of positive tag scores - sum of negative tag scores
+    score = tags_df[pos].sum(axis=1) if pos else pd.Series(0.0, index=tags_df.index)
+    if neg:
+        score = score - tags_df[neg].sum(axis=1)
+    
+    # Sort, filter out already-rated, apply year filters
+    rated_ids = {r["book_id"] for r in ratings}
+    rated_authors = {r.get("matched_author", "").lower() for r in ratings if r.get("matched_author")}
+    
+    ranked = score.sort_values(ascending=False)
+    
+    results = []
+    for book_id, s in ranked.items():
+        if str(book_id) in {str(rid) for rid in rated_ids}:
+            continue
+        row = df[df["book_id"].astype(str) == str(book_id)]
+        if row.empty:
+            continue
+        b = row.iloc[0]
+        if b["primary_author"].lower() in rated_authors:
+            continue
+        if b["ratings_count"] < 2000:
+            continue
+        yr = b["publication_year"]
+        if min_year is not None and (pd.isna(yr) or yr < min_year):
+            continue
+        if max_year is not None and (pd.isna(yr) or yr > max_year):
+            continue
+        
+        # Show which tags drove the score
+        book_tags = tags_df.loc[book_id]
+        top_tags = book_tags.nlargest(5)
+        top_tags = [(t, round(float(v), 2)) for t, v in top_tags.items() if v > 0]
+        
+        results.append({
+            "title": b["title"],
+            "author": b["primary_author"],
+            "year": int(yr) if pd.notna(yr) else None,
+            "tag_score": round(float(s), 2),
+            "top_tags": top_tags,
+        })
+        if len(results) >= limit:
+            break
+    
+    return {
+        "positive_tags_used": pos,
+        "negative_tags_used": neg,
+        "invalid_tags": invalid,
+        "results": results,
+        "note": f"Searched {len(tags_df):,} tagged books. Tagged subset is ~5K popular books — not the full catalog.",
+    }
+
 
 # tool schemas exposed to Claude
 TOOLS = [
@@ -263,7 +346,30 @@ TOOLS = [
             "max_year": {"type": "integer"},
         },
         "required": ["query"],},
-    }
+    },
+    {
+    "name": "search_by_tags",
+    "description": "Search books by quality-tags (NOT genres). Returns books from the tagged subset (~5,000 popular books) scoring high on positive tags and optionally low on negative tags. Use when the user asks for specific qualities like 'books with unreliable narrators,' 'slow-burn dark academia,' 'fast-paced sci-fi without romance,' etc. Available tags include pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical), narrator (unreliable-narrator, first-person, multiple-povs), structure (non-linear, epistolary, dual-timeline), style (literary-prose, witty, lyrical, satirical), themes (coming-of-age, grief, identity, found-family, legacy, hubris), experience (page-turner, thought-provoking, mind-bending, comfort-read), and genres (high-fantasy, urban-fantasy, dark-academia, science-fiction, cyberpunk, dystopian, space-opera, climate-fiction, time-travel). Returns books with each book's top contributing tags for explanation. Note: only ~5K popular books have tags, so this won't cover the full catalog.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "positive_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags the book SHOULD score high on."
+            },
+            "negative_tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Tags the book should score LOW on (for excluding qualities)."
+            },
+            "limit": {"type": "integer"},
+            "min_year": {"type": "integer"},
+            "max_year": {"type": "integer"},
+        },
+    },
+},
+
 ]
 
 TOOL_IMPLS = {
@@ -271,6 +377,7 @@ TOOL_IMPLS = {
     "get_recommendations": _tool_get_recommendations,
     "search_catalog": _tool_search_catalog,
     "search_catalog_semantic": _tool_search_catalog_semantic,
+    "search_by_tags": _tool_search_by_tags
 }
 
 SYSTEM_PROMPT = """You are a thoughtful book recommendation assistant. You help the user find books to read based on their taste and their requests.
@@ -294,6 +401,14 @@ Decide which path the request needs:
 2. Identify 2-3 qualities the user reliably enjoys (twists, character-driven, witty, fast-paced, dark humor, immersive worldbuilding, literary prose, etc.). Reference specific books they've rated highly.
 3. Call search_catalog_semantic with a query that combines the requested genre + those qualities. e.g. "cyberpunk character-driven with literary depth" or "western with dark humor and twists".
 4. Present the picks by EXPLICITLY BRIDGING: "You rated [book] highly for [quality] — here's a cyberpunk novel with that same [quality]." This is the value-add: don't just dump genre results, show the user why these specific picks fit them.
+
+**Path C — request is QUALITY-based** (e.g. "unreliable narrators," "slow-burn dark academia," "books with twists set in space"):
+1. Use search_by_tags with positive_tags listing the qualities, optionally negative_tags for things to avoid.
+2. Cross-reference with the user's taste — note which returned books have tags that overlap with what they've rated highly.
+3. Explain the picks by referencing the specific tags ("This scores high on unreliable-narrator and atmospheric, both qualities you rated highly in X").
+4. Note that this only searches a ~5K subset of tagged books — if results are weak, fall back to search_catalog_semantic.
+
+You can also COMBINE paths: for "cyberpunk with witty dialogue," call search_by_tags with positive=[cyberpunk, witty, dialogue-heavy], then explain bridges to the user's taste.
 
 CRITICAL: Never recommend books the user has already rated. Their ratings are visible via search_user_ratings — those are books they've read. Recommendations must always be NEW books from the catalog. 
 If you're tempted to suggest a book they've rated, that's a sign you haven't actually searched for fresh recommendations yet.
