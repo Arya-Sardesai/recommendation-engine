@@ -16,6 +16,7 @@ FILES = [
     "embeddings_minilm_v1.npy",
     "faiss_minilm_v1.index",
     "my_matched_ratings.json",
+    "book_tags.parquet",
 ]
 
 api = HfApi()
