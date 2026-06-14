@@ -27,10 +27,17 @@ sys.path.insert(0, str(Path(__file__).parent))
 from tag_taxonomy import ALL_MOVIE_TAGS  # noqa: E402
 
 ROOT = Path(__file__).parent.parent.parent
-ML = ROOT / "data" / "raw" / "movies"
 PROC = ROOT / "data" / "processed"
 CORPUS = PROC / "movies.parquet"
 OUT = PROC / "movie_tags.parquet"
+
+# MovieLens files may sit under data/raw/movies/ml-25m/ (zip extracts a
+# top-level ml-25m/ folder) or directly in data/raw/movies/. Auto-detect.
+_MOVIES = ROOT / "data" / "raw" / "movies"
+if (_MOVIES / "ml-25m" / "genome-scores.csv").exists():
+    ML = _MOVIES / "ml-25m"
+else:
+    ML = _MOVIES
 
 THRESHOLD = 0.30   # same sparse cutoff as books
 MAX_TAGS_PER_FILM = 7  # match book per-item cap
@@ -46,64 +53,65 @@ MAX_TAGS_PER_FILM = 7  # match book per-item cap
 # ---------------------------------------------------------------------------
 GENOME_MAP = {
     # --- speculative themes ---
-    "science-fiction": ["sci-fi", "science fiction", "futuristic"],
-    "dystopian": ["dystopia", "dystopic future", "post-apocalyptic"],
-    "space-opera": ["space", "spacetravel", "space travel", "aliens"],
-    "cyberpunk": ["cyberpunk", "artificial intelligence", "virtual reality", "robots"],
-    "climate-fiction": ["environmental", "climate change", "nature"],
-    "time-travel": ["time travel", "time-travel"],
-    "time-loop": ["time loop", "groundhog day"],
+    "science-fiction": ["sci-fi", "science fiction", "scifi", "sci fi", "futuristic"],
+    "dystopian": ["dystopia", "dystopic future", "distopia", "post-apocalyptic"],
+    "space-opera": ["space opera", "space", "space travel", "aliens", "astronauts"],
+    "cyberpunk": ["cyberpunk", "artificial intelligence", "virtual reality", "robots", "androids"],
+    "climate-fiction": ["global warming", "environmental", "environment", "ecology", "nature"],
+    "time-travel": ["time travel"],
+    "time-loop": ["time loop"],
     "post-apocalyptic": ["post-apocalyptic", "post apocalyptic", "apocalypse", "end of the world"],
-    "fantasy": ["fantasy", "magic", "fairy tale", "mythology"],
-    "historical": ["history", "historical", "period piece", "based on a true story"],
-    "mystery": ["mystery", "whodunit", "detective"],
-    "thriller": ["suspense", "thriller", "psychological thriller"],
-    "horror": ["horror", "supernatural", "zombies", "vampires", "slasher"],
-    "romance": ["romance", "love", "romantic"],
-    "war": ["war", "world war ii", "military", "wartime"],
+    "fantasy": ["fantasy", "magic", "fairy tale", "mythology", "high fantasy", "fantasy world"],
+    "historical": ["history", "historical", "period piece", "based on a true story", "true story"],
+    "mystery": ["mystery", "murder mystery", "detective", "investigation"],
+    "thriller": ["suspense", "thriller", "suspenseful", "psychological"],
+    "horror": ["horror", "supernatural", "zombies", "vampires", "slasher", "scary"],
+    "romance": ["romance", "love", "romantic", "love story"],
+    "war": ["war", "world war ii", "military", "wartime", "war movie"],
     "crime": ["crime", "heist", "mafia", "gangster", "organized crime"],
-    "coming-of-age": ["coming of age", "coming-of-age", "growing up", "adolescence"],
+    "coming-of-age": ["coming of age", "coming-of-age", "teenager", "adolescence"],
     "satire": ["satire", "satirical", "social commentary"],
 
     # --- mood ---
     "dark": ["dark", "dark comedy", "bleak", "disturbing"],
-    "hopeful": ["uplifting", "inspirational", "feel good"],
-    "melancholic": ["melancholy", "bittersweet", "sad", "depressing"],
-    "humorous": ["funny", "comedy", "hilarious", "humor"],
+    "hopeful": ["inspirational", "inspiring", "heartwarming"],
+    "melancholic": ["melancholy", "melancholic", "bittersweet", "sad", "depressing"],
+    "humorous": ["funny", "comedy", "hilarious", "humor", "humorous"],
     "bleak": ["bleak", "depressing", "grim"],
-    "feel-good": ["feel good", "feel-good", "heartwarming", "uplifting"],
-    "tense": ["tense", "suspenseful", "edge of your seat"],
-    "whimsical": ["quirky", "whimsical", "offbeat"],
+    "feel-good": ["feel good movie", "feel-good", "heartwarming"],
+    "tense": ["tense", "suspenseful", "intense"],
+    "whimsical": ["quirky", "whimsical", "eccentricity", "absurd"],
 
     # --- experience / pace ---
-    "slow-burn": ["slow", "slow paced", "slow burn"],
+    "slow-burn": ["slow", "slow paced"],
     "fast-paced": ["fast paced", "action packed", "action"],
-    "mind-bending": ["mindfuck", "mind-bending", "surreal", "trippy", "confusing"],
-    "tearjerker": ["tearjerker", "emotional", "cry"],
+    "mind-bending": ["mindfuck", "surreal", "psychedelic", "confusing"],
+    "tearjerker": ["tear jerker", "heartbreaking", "emotional"],
     "atmospheric": ["atmospheric", "moody", "stylish"],
     "twist-ending": ["twist ending", "plot twist", "surprise ending", "twist"],
-    "nonlinear": ["nonlinear", "non-linear", "nonlinear timeline", "multiple storylines"],
+    "nonlinear": ["nonlinear", "non-linear", "multiple storylines"],
 
     # --- relationships / conflict ---
-    "found-family": ["friendship", "family"],
-    "enemies-to-lovers": ["enemies to lovers"],
-    "forbidden-love": ["forbidden love", "affair", "infidelity"],
+    "found-family": ["friendship", "family", "family bonds"],
+    "enemies-to-lovers": [],  # no genome equivalent
+    "forbidden-love": ["infidelity", "adultery", "interracial romance"],
     "survival": ["survival", "stranded", "wilderness"],
     "revenge": ["revenge", "vengeance"],
-    "redemption": ["redemption", "second chance"],
+    "redemption": ["redemption"],
     "man-vs-nature": ["nature", "disaster", "natural disaster"],
     "political": ["politics", "political", "conspiracy"],
 
     # --- movie-only ---
-    "visually-stunning": ["visually appealing", "beautiful", "cinematography", "visually stunning"],
-    "long-take": ["long take", "single shot"],
-    "practical-effects": ["practical effects", "special effects", "great special effects"],
-    "stylized-violence": ["stylized", "violent", "violence", "bloody"],
-    "ensemble-cast": ["ensemble cast", "all star cast"],
+    "visually-stunning": ["visually stunning", "visually appealing", "beautiful", "cinematography",
+                          "great cinematography", "amazing cinematography", "beautifully filmed"],
+    "long-take": [],  # no genome equivalent
+    "practical-effects": ["special effects", "effects"],
+    "stylized-violence": ["stylized", "violent", "violence", "bloody", "gore"],
+    "ensemble-cast": ["ensemble cast"],
     "black-and-white": ["black and white"],
-    "found-footage": ["found footage"],
+    "found-footage": ["fake documentary", "mockumentary"],
     "musical": ["musical", "music"],
-    "animation": ["animation", "anime", "animated"],
+    "animation": ["animation", "anime", "animated", "computer animation"],
     "documentary-style": ["documentary", "mockumentary"],
 }
 
