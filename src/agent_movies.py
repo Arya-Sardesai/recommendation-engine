@@ -554,7 +554,14 @@ Decide which path the request needs:
 
 You can COMBINE paths: for "Korean revenge thrillers like the crime films I like," search_by_tags(positive=[revenge, thriller]) or search_catalog_semantic('revenge thriller', language='Korean'), then bridge to their taste.
 
-CRITICAL: Never recommend films the user has already rated — those are visible via search_user_ratings. Recommendations must always be NEW films from the catalog. Only recommend films that appear in your tool results; if you think of one but haven't seen it returned, verify with search_catalog first. Never recommend from memory alone.
+CRITICAL — GROUNDING RULE (read carefully):
+Every single film you name in a recommendation MUST appear, by title, in a tool result you received in THIS conversation. This is an absolute rule:
+- Do NOT add films from your own knowledge, even if they fit the request perfectly and you are confident they exist. If a great film comes to mind but it is not in your tool results, you may NOT name it — instead, run another tool search to try to surface it.
+- Never recommend films the user has already rated (visible via search_user_ratings).
+- If your tool results don't contain enough good matches, say so honestly and offer to search differently, rather than padding the list with films from memory.
+- Prefer the EXACT titles as they appear in the tool results. Do not rename, retranslate, or "correct" them.
+- When in doubt about whether a film is in the catalog, call search_catalog to verify before naming it.
+The recommender's entire value is that it is grounded in this specific catalog and the user's actual ratings. A recommendation the tools didn't return is worse than no recommendation — it breaks trust and may point to a film that isn't in the catalog at all.
 
 When a user asks for "something to watch" without specifying, treat it as Path B: infer qualities from their ratings, then search_catalog_semantic for fresh unseen films matching those qualities + any constraint they gave.
 
@@ -565,11 +572,78 @@ Other guidance:
 - The catalog is films only (no books/TV), spanning world cinema up to 2025."""
 
 
+def _titles_from_result(result):
+    """Pull every film title out of a tool result dict (any tool's shape)."""
+    titles = set()
+    if not isinstance(result, dict):
+        return titles
+    for key in ("recommendations", "results", "matched_films", "ratings"):
+        items = result.get(key)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("title"):
+                    titles.add(it["title"])
+    return titles
+
+
+def _check_faithfulness(reply, seen_titles):
+    """Find film titles in the reply that were never returned by any tool.
+
+    Precision matters: we only treat a phrase as a *film title* if it is
+    shaped like one — i.e. immediately followed by a parenthetical containing
+    a 4-digit year and/or a director, e.g.:
+        "Smokin' Aces (Joe Carnahan, 2006)"
+        "Ocean's Eleven (2001)"
+        "**Snatch** (Guy Ritchie, 2000)"
+    This avoids flagging prose fragments ("Why these fit:", "exactly") that a
+    looser bold/numbered-list scan would wrongly catch.
+    Returns a list of suspicious (likely-hallucinated) titles.
+    """
+    import re
+
+    # Title candidate = text right before a parenthetical that contains a year.
+    # Capture the run of words (optionally bolded) preceding "(... 19xx/20xx ...)".
+    pattern = re.compile(
+        r"(?:\*\*)?"                       # optional opening bold
+        r"([A-Z0-9][^\n*()]{1,70}?)"       # the title text (starts capitalized)
+        r"(?:\*\*)?"                       # optional closing bold
+        r"\s*\((?:[^)]*?\b(?:19|20)\d{2}\b[^)]*)\)"  # ( ... yyyy ... )
+    )
+    cands = [m.group(1).strip().rstrip(":–-—").strip() for m in pattern.finditer(reply)]
+    # strip any leading list-number prefix ("1. Title" -> "Title")
+    cands = [re.sub(r"^\d+\.\s*", "", c).strip() for c in cands]
+
+    def norm(s):
+        return "".join(ch for ch in s.lower() if ch.isalnum())
+
+    seen_norm = {norm(t) for t in seen_titles}
+    suspicious, suspicious_norms = [], set()
+    for c in cands:
+        cn = norm(c)
+        if len(cn) < 3 or cn in suspicious_norms:
+            continue
+        if cn in seen_norm:
+            continue
+        if any(cn in s or s in cn for s in seen_norm if len(s) >= 4):
+            continue
+        suspicious.append(c)
+        suspicious_norms.add(cn)
+    return suspicious
+
+
 def run_agent(user_message, state, conversation_history=None, max_turns=6, verbose=True):
-    """Run the agentic loop. Returns (final_text, updated_history)."""
+    """Run the agentic loop. Returns (final_text, updated_history).
+
+    Tracks every title returned by tools and, after the model's final answer,
+    checks whether the answer names any film the tools never returned (a sign
+    of the model freelancing from memory). When verbose, prints the returned
+    titles and any suspicious (likely-hallucinated) ones.
+    """
     client = Anthropic()
     history = conversation_history or []
     history = history + [{"role": "user", "content": user_message}]
+
+    seen_titles = set()  # every film title any tool returned this turn
 
     for turn in range(max_turns):
         resp = client.messages.create(
@@ -581,17 +655,36 @@ def run_agent(user_message, state, conversation_history=None, max_turns=6, verbo
         history.append({"role": "assistant", "content": resp.content})
 
         if not tool_calls:
-            return "\n".join(text_blocks), history
+            reply = "\n".join(text_blocks)
+            # faithfulness check against everything the tools returned
+            suspicious = _check_faithfulness(reply, seen_titles)
+            if verbose and suspicious:
+                print(f"  [!] WARNING: {len(suspicious)} title(s) in the reply were "
+                      f"NOT in any tool result (possible hallucination):")
+                for s in suspicious:
+                    print(f"        - {s}")
+            elif verbose:
+                print(f"  [ok] all recommended titles were grounded in tool results "
+                      f"({len(seen_titles)} films seen across tools)")
+            return reply, history
 
         tool_results = []
         for tc in tool_calls:
-            if verbose:
-                print(f"  [agent calls {tc.name}({json.dumps(tc.input)})]")
             impl = TOOL_IMPLS.get(tc.name)
             try:
                 result = impl(state, **tc.input)
             except Exception as e:
                 result = {"error": str(e)}
+            returned = _titles_from_result(result)
+            seen_titles |= returned
+            if verbose:
+                print(f"  [agent calls {tc.name}({json.dumps(tc.input)})]")
+                if returned:
+                    preview = list(returned)[:8]
+                    more = f" (+{len(returned) - 8} more)" if len(returned) > 8 else ""
+                    print(f"        -> returned {len(returned)} films: {', '.join(preview)}{more}")
+                else:
+                    print(f"        -> (no film titles in result)")
             tool_results.append({
                 "type": "tool_result", "tool_use_id": tc.id,
                 "content": json.dumps(result),
