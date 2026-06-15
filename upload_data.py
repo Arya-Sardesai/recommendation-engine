@@ -4,6 +4,7 @@ The deployed Space downloads these files at startup.
 
 v2: added the movie artifacts alongside the books artifacts so the unified
 two-tab Space can serve both modalities.
+v3: added the TV artifacts for the third tab (no tv_tags - TV ships tagless in v1).
 """
 from pathlib import Path
 from huggingface_hub import HfApi, create_repo
@@ -26,6 +27,10 @@ FILES = [
     "movie_embeddings_minilm_v1.npy",
     "movie_faiss_minilm_v1.index",
     "movie_tags.parquet",
+    # --- tv (v1: no tag file, ships tagless) ---
+    "tv_corpus.parquet",
+    "tv_embeddings_minilm_v1.npy",
+    "tv_faiss_minilm_v1.index",
 ]
 
 api = HfApi()
