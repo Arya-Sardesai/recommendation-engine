@@ -22,15 +22,21 @@ FILES = [
     "faiss_minilm_v1.index",
     "my_matched_ratings.json",
     "book_tags.parquet",
+    "embeddings_bgem3.npy",            # NEW: books BGE-M3
+    "faiss_bgem3.index",              # NEW
     # --- movies ---
     "movies.parquet",
     "movie_embeddings_minilm_v1.npy",
     "movie_faiss_minilm_v1.index",
     "movie_tags.parquet",
+    "movie_embeddings_bgem3_v2_kw.npy",   # NEW: movies BGE-M3
+    "movie_faiss_bgem3_v2_kw.index",      # NEW
     # --- tv (v1: no tag file, ships tagless) ---
     "tv_corpus.parquet",
     "tv_embeddings_minilm_v1.npy",
     "tv_faiss_minilm_v1.index",
+    "tv_embeddings_bgem3_v2_notitle.npy", # NEW: tv BGE-M3
+    "tv_faiss_bgem3_v2_notitle.index",    # NEW
 ]
 
 api = HfApi()
