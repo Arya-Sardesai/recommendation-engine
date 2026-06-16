@@ -40,8 +40,10 @@ TAGS = PROCESSED / "movie_tags.parquet"        # optional; objective metric if p
 BUILDS = {
     "v1_rich":  (PROCESSED / "movie_embeddings_minilm_v1.npy",
                  PROCESSED / "movie_faiss_minilm_v1.index"),
-     "v2_kw":  (PROCESSED / "movie_embeddings_allminilml6v_v2_kw.npy",
+    "v2_kw":  (PROCESSED / "movie_embeddings_allminilml6v_v2_kw.npy",
                 PROCESSED / "movie_faiss_allminilml6v_v2_kw.index"),
+    "v3_kw":  (PROCESSED / "movie_embeddings_bgem3_v2_kw.npy",
+                PROCESSED / "movie_faiss_bgem3_v2_kw.index"),
 }
 
 SEEDS = [
