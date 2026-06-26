@@ -32,7 +32,7 @@ def _get_query_embedder(state):
         from sentence_transformers import SentenceTransformer
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+        model = SentenceTransformer("BAAI/bge-m3", device=device)
         state["query_embedder"] = model
     return state["query_embedder"]
 
@@ -112,6 +112,8 @@ def _tool_get_recommendations(state, anchor_titles, n=10, min_year=None, max_yea
     for i in range(len(anchors)):
         q = []
         for s, ix in zip(sims[i], idxs[i]):
+            if ix < 0:        # FAISS pads with -1 when fewer neighbors than k exist
+                continue
             b = df.iloc[ix]
             if b["book_id"] in rated_ids:
                 continue
@@ -178,6 +180,8 @@ def _tool_search_catalog_semantic(state, query, limit=15, min_year=None, max_yea
     results = []
     seen_works = set()
     for s, ix in zip(sims[0], idxs[0]):
+        if ix < 0:        # FAISS pads with -1 when fewer neighbors than k exist
+            continue
         b = df.iloc[ix]
         if b["book_id"] in rated_ids:
             continue
@@ -213,7 +217,7 @@ def _tool_search_catalog_semantic(state, query, limit=15, min_year=None, max_yea
 
 def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15, min_year=None, max_year=None):
     """Search the tagged subset by quality-tags. Returns books scoring high on positive
-    tags and low on negative tags. Only works for the ~5K books that have been tagged."""
+    tags and low on negative tags. Only works for the ~33K books that have been tagged."""
     df = state["df"]
     ratings = state["ratings"]
     
@@ -291,7 +295,7 @@ def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15
         "negative_tags_used": neg,
         "invalid_tags": invalid,
         "results": results,
-        "note": f"Searched {len(tags_df):,} tagged books. Tagged subset is ~5K popular books — not the full catalog.",
+        "note": f"Searched {len(tags_df):,} tagged books. Tagged subset is ~33K books (>=10K ratings) — not the full catalog.",
     }
 
 
@@ -349,7 +353,7 @@ TOOLS = [
     },
     {
     "name": "search_by_tags",
-    "description": "Search books by quality-tags (NOT genres). Returns books from the tagged subset (~5,000 popular books) scoring high on positive tags and optionally low on negative tags. Use when the user asks for specific qualities like 'books with unreliable narrators,' 'slow-burn dark academia,' 'fast-paced sci-fi without romance,' etc. Available tags include pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical), narrator (unreliable-narrator, first-person, multiple-povs), structure (non-linear, epistolary, dual-timeline), style (literary-prose, witty, lyrical, satirical), themes (coming-of-age, grief, identity, found-family, legacy, hubris), experience (page-turner, thought-provoking, mind-bending, comfort-read), and genres (high-fantasy, urban-fantasy, dark-academia, science-fiction, cyberpunk, dystopian, space-opera, climate-fiction, time-travel). Returns books with each book's top contributing tags for explanation. Note: only ~5K popular books have tags, so this won't cover the full catalog.",
+    "description": "Search books by quality-tags (NOT genres). Returns books from the tagged subset (~33K popular books) scoring high on positive tags and optionally low on negative tags. Use when the user asks for specific qualities like 'books with unreliable narrators,' 'slow-burn dark academia,' 'fast-paced sci-fi without romance,' etc. Available tags include pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical), narrator (unreliable-narrator, first-person, multiple-povs), structure (non-linear, epistolary, dual-timeline), style (literary-prose, witty, lyrical, satirical), themes (coming-of-age, grief, identity, found-family, legacy, hubris), experience (page-turner, thought-provoking, mind-bending, comfort-read), and genres (high-fantasy, urban-fantasy, dark-academia, science-fiction, cyberpunk, dystopian, space-opera, climate-fiction, time-travel). Returns books with each book's top contributing tags for explanation. Note: only ~33K books (the >=10K-rating subset) have tags, so this won't cover the full catalog.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -406,14 +410,20 @@ Decide which path the request needs:
 1. Use search_by_tags with positive_tags listing the qualities, optionally negative_tags for things to avoid.
 2. Cross-reference with the user's taste — note which returned books have tags that overlap with what they've rated highly.
 3. Explain the picks by referencing the specific tags ("This scores high on unreliable-narrator and atmospheric, both qualities you rated highly in X").
-4. Note that this only searches a ~5K subset of tagged books — if results are weak, fall back to search_catalog_semantic.
+4. Note that this only searches the ~33K tagged subset — if results are weak, fall back to search_catalog_semantic.
 
 You can also COMBINE paths: for "cyberpunk with witty dialogue," call search_by_tags with positive=[cyberpunk, witty, dialogue-heavy], then explain bridges to the user's taste.
 
-CRITICAL: Never recommend books the user has already rated. Their ratings are visible via search_user_ratings — those are books they've read. Recommendations must always be NEW books from the catalog. 
-If you're tempted to suggest a book they've rated, that's a sign you haven't actually searched for fresh recommendations yet.
+CRITICAL — GROUNDING RULE (read carefully):
+Every single book you name in a recommendation MUST appear, by title, in a tool result you received in THIS conversation. This is an absolute rule:
+- Do NOT add books from your own knowledge, even if they fit the request perfectly and you are confident they exist. If a great book comes to mind but it is not in your tool results, you may NOT name it — instead, run another tool search to try to surface it.
+- Never recommend books the user has already rated (visible via search_user_ratings — those are books they've read).
+- If your tool results don't contain enough good matches, say so honestly and offer to search differently, rather than padding the list with books from memory.
+- Prefer the EXACT titles as they appear in the tool results. Do not rename, retranslate, or "correct" them.
+- When in doubt about whether a book is in the catalog, call search_catalog to verify before naming it.
+The recommender's entire value is that it is grounded in this specific catalog and the user's actual ratings. A recommendation the tools didn't return is worse than no recommendation — it breaks trust and may point to a book that isn't in the catalog at all.
+
 When a user asks for "something to read" (short, long, fun, dark, etc.) without specifying genre, treat it as Path B — use their ratings to infer qualities, then search_catalog_semantic for fresh unread books matching those qualities + the constraint they gave.
-Only recommend books that appear in your tool results. If you have an idea for a book but haven't seen it returned by search_catalog or search_catalog_semantic, verify it with search_catalog first before mentioning it. Never recommend from memory alone.
 
 Other guidance:
 - For mood shifts ("lighter", "darker", "faster-paced") that the tools can't filter directly, use judgment to pick from results and explain.
@@ -422,11 +432,71 @@ Other guidance:
 - The catalog is books only (no film/TV), up to 2025."""
 
 
+def _titles_from_result(result):
+    """Pull every book title out of a tool result dict (any tool's shape)."""
+    titles = set()
+    if not isinstance(result, dict):
+        return titles
+    for key in ("recommendations", "results", "matched_books", "ratings"):
+        items = result.get(key)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("title"):
+                    titles.add(it["title"])
+    return titles
+
+
+def _check_faithfulness(reply, seen_titles):
+    """Find book titles in the reply that were never returned by any tool.
+
+    Precision matters: we only treat a phrase as a *title* if it is shaped like
+    one — immediately followed by a parenthetical containing a 4-digit year
+    and/or an author, e.g. "Piranesi (Susanna Clarke, 2020)" or "Dune (1965)".
+    This avoids flagging prose fragments that a looser bold/numbered-list scan
+    would wrongly catch. Returns a list of suspicious (likely-hallucinated) titles.
+    """
+    import re
+
+    pattern = re.compile(
+        r"(?:\*\*)?"                       # optional opening bold
+        r"([A-Z0-9][^\n*()]{1,70}?)"       # the title text (starts capitalized)
+        r"(?:\*\*)?"                       # optional closing bold
+        r"\s*\((?:[^)]*?\b(?:19|20)\d{2}\b[^)]*)\)"  # ( ... yyyy ... )
+    )
+    cands = [m.group(1).strip().rstrip(":–-—").strip() for m in pattern.finditer(reply)]
+    cands = [re.sub(r"^\d+\.\s*", "", c).strip() for c in cands]
+
+    def norm(s):
+        return "".join(ch for ch in s.lower() if ch.isalnum())
+
+    seen_norm = {norm(t) for t in seen_titles}
+    suspicious, suspicious_norms = [], set()
+    for c in cands:
+        cn = norm(c)
+        if len(cn) < 3 or cn in suspicious_norms:
+            continue
+        if cn in seen_norm:
+            continue
+        if any(cn in s or s in cn for s in seen_norm if len(s) >= 4):
+            continue
+        suspicious.append(c)
+        suspicious_norms.add(cn)
+    return suspicious
+
+
 def run_agent(user_message, state, conversation_history=None, max_turns=6, verbose=True):
-    """Run the agentic loop. Returns (final_text, updated_history)."""
+    """Run the agentic loop. Returns (final_text, updated_history).
+
+    Tracks every title returned by tools and, after the model's final answer,
+    checks whether the answer names any book the tools never returned (a sign of
+    the model freelancing from memory). When verbose, prints returned titles and
+    any suspicious (likely-hallucinated) ones.
+    """
     client = Anthropic()
     history = conversation_history or []
     history = history + [{"role": "user", "content": user_message}]
+
+    seen_titles = set()  # every book title any tool returned this turn
 
     for turn in range(max_turns):
         resp = client.messages.create(
@@ -440,18 +510,35 @@ def run_agent(user_message, state, conversation_history=None, max_turns=6, verbo
         history.append({"role": "assistant", "content": resp.content})
 
         if not tool_calls:
-            final = "\n".join(text_blocks)
-            return final, history
+            reply = "\n".join(text_blocks)
+            suspicious = _check_faithfulness(reply, seen_titles)
+            if verbose and suspicious:
+                print(f"  [!] WARNING: {len(suspicious)} title(s) in the reply were "
+                      f"NOT in any tool result (possible hallucination):")
+                for s in suspicious:
+                    print(f"        - {s}")
+            elif verbose:
+                print(f"  [ok] all recommended titles were grounded in tool results "
+                      f"({len(seen_titles)} books seen across tools)")
+            return reply, history
 
         tool_results = []
         for tc in tool_calls:
-            if verbose:
-                print(f"  [agent calls {tc.name}({json.dumps(tc.input)})]")
             impl = TOOL_IMPLS.get(tc.name)
             try:
                 result = impl(state, **tc.input)
             except Exception as e:
                 result = {"error": str(e)}
+            returned = _titles_from_result(result)
+            seen_titles |= returned
+            if verbose:
+                print(f"  [agent calls {tc.name}({json.dumps(tc.input)})]")
+                if returned:
+                    preview = list(returned)[:8]
+                    more = f" (+{len(returned) - 8} more)" if len(returned) > 8 else ""
+                    print(f"        -> returned {len(returned)} books: {', '.join(preview)}{more}")
+                else:
+                    print(f"        -> (no book titles in result)")
             tool_results.append({
                 "type": "tool_result", "tool_use_id": tc.id,
                 "content": json.dumps(result),

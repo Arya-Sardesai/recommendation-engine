@@ -26,8 +26,8 @@ REPO_ROOT = APP_DIR.parent
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 
 CORPUS_PATH = PROCESSED_DIR / "books_v1.parquet"
-EMBEDDINGS_PATH = PROCESSED_DIR / "embeddings_minilm_v1.npy"
-FAISS_PATH = PROCESSED_DIR / "faiss_minilm_v1.index"
+EMBEDDINGS_PATH = PROCESSED_DIR / "embeddings_bgem3.npy"
+FAISS_PATH = PROCESSED_DIR / "faiss_bgem3.index"
 DEFAULT_RATINGS_PATH = PROCESSED_DIR / "my_matched_ratings.json"
 
 st.set_page_config(page_title="Recommendation Engine — Agent", page_icon="book", layout="wide")

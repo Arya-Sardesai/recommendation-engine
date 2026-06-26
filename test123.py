@@ -1,9 +1,4 @@
-import pandas as pd, json
-from pathlib import Path
-from collections import Counter
-# re-collect dropped tags by re-parsing isn't needed — just inspect what we have:
-v2 = pd.read_parquet("data/processed/book_tags_v2.parquet")
-print("books:", v2.book_id.nunique(), "| rows:", len(v2), "| distinct tags:", v2.tag.nunique())
-print("\ntags per book distribution:")
-print(v2.groupby("book_id").size().describe())
-print("\nany book with very few tags?", (v2.groupby("book_id").size() <= 2).sum(), "books have <=2 tags")
+import numpy as np
+v = np.load("data/processed/embeddings_bgem3.npy")           # (432715, 1024) float32
+np.save("data/processed/embeddings_bgem3_fp16.npy", v.astype(np.float16))
+# then upload embeddings_bgem3_fp16.npy to the dataset repo via your upload_data.py

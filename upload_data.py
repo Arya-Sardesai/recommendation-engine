@@ -23,7 +23,8 @@ FILES = [
     "my_matched_ratings.json",
     "book_tags.parquet",
     "embeddings_bgem3.npy",            # NEW: books BGE-M3
-    "faiss_bgem3.index",              # NEW
+    "faiss_bgem3.index",  
+    "embeddings_bgem3_fp16.npy",        # NEW
     # --- movies ---
     "movies.parquet",
     "movie_embeddings_minilm_v1.npy",

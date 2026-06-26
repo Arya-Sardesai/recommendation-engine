@@ -28,8 +28,8 @@ REPO_ROOT = APP_DIR.parent
 PROCESSED_DIR = REPO_ROOT / "data" / "processed"
 
 CORPUS_PATH = PROCESSED_DIR / "movies.parquet"
-EMBEDDINGS_PATH = PROCESSED_DIR / "movie_embeddings_minilm_v1.npy"
-FAISS_PATH = PROCESSED_DIR / "movie_faiss_minilm_v1.index"
+EMBEDDINGS_PATH = PROCESSED_DIR / "movie_embeddings_bgem3_v2_kw.npy"
+FAISS_PATH = PROCESSED_DIR / "movie_faiss_bgem3_v2_kw.index"
 
 st.set_page_config(page_title="Movie Recommendation Engine — Agent", page_icon="clapper", layout="wide")
 

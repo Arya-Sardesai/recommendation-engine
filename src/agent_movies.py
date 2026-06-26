@@ -57,7 +57,7 @@ def _get_query_embedder(state):
         from sentence_transformers import SentenceTransformer
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = SentenceTransformer("all-MiniLM-L6-v2", device=device)
+        model = SentenceTransformer("BAAI/bge-m3", device=device)
         state["query_embedder"] = model
     return state["query_embedder"]
 
