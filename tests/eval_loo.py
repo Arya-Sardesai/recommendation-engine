@@ -32,9 +32,9 @@ multi-user harness is the definitive one (separate chapter).
 
 HOW TO RUN (locally, from the repo)
   1. Set the artifact paths below to your data/processed/ files.
-  2. Export your ratings: open the Space with ?debug=1, copy the raw stored
-     value of re_movies into a file movies_ratings.json (it's already the
-     right JSON shape).
+  2. Export your ratings: open the Space with ?debug=1 and copy the ENTIRE
+     "raw stored values" blob into movies_ratings.json — the script extracts
+     re_movies from it automatically (a bare re_movies value also works).
   3. python eval_loo.py movies_ratings.json
 Runtime: a few minutes (one full recommend per holdout).
 """
@@ -55,7 +55,7 @@ CORPUS_PATH = PROCESSED / "movies.parquet"
 EMB_PATH = PROCESSED / "movie_embeddings_bgem3_v2_kw.npy"
 FAISS_PATH = PROCESSED / "movie_faiss_bgem3_v2_kw.index"
 TAGS_PATH = PROCESSED / "movie_tags.parquet"          # optional; skipped if absent
-APP_PY = Path(__file__).resolve().parents[1].parent / "hf-space" / "app.py"   # adjust if app.py lives elsewhere
+APP_PY = Path(__file__).resolve().parents[1].parent / "hf-space" / "app.py"   # main/tests -> Poject/hf-space/app.py
 
 LIKE_HOLDOUT = 4.0   # hold out every film rated >= this
 MAX_K = 50           # rank horizon; beyond this counts as a miss
@@ -162,13 +162,29 @@ def evaluate(ratings, df, embeddings, index, tags_df, recommend_movies):
     print("recommender must clear.")
 
 
+def parse_ratings(path):
+    """Accept any of the shapes the debug panel produces:
+    - the full getAll() dump: {"re_movies": "[...]", "re_books": ...}  <- most common
+    - the re_movies value alone, double-encoded ("[{...}]") or as a list
+    """
+    raw = json.load(open(path, encoding="utf-8"))
+    if isinstance(raw, dict):
+        if "re_movies" not in raw or not raw["re_movies"]:
+            sys.exit(f"error: no 're_movies' key found in {path} — "
+                     f"keys present: {list(raw.keys())}")
+        raw = raw["re_movies"]
+    if isinstance(raw, str):                  # localStorage double-encodes
+        raw = json.loads(raw)
+    if not isinstance(raw, list) or not raw:
+        sys.exit(f"error: {path} did not yield a list of ratings")
+    return raw
+
+
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
         sys.exit("usage: python eval_loo.py movies_ratings.json")
-    ratings_raw = json.load(open(sys.argv[1], encoding="utf-8"))
-    if isinstance(ratings_raw, str):          # localStorage double-encodes
-        ratings_raw = json.loads(ratings_raw)
+    ratings_raw = parse_ratings(sys.argv[1])
     print(f"loaded {len(ratings_raw)} ratings from {sys.argv[1]}")
 
     recommend_movies = load_app_functions(APP_PY)
