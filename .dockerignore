@@ -1,0 +1,23 @@
+@'
+# Heavy artifacts and raw data — mounted as a volume, never baked into the image
+data/
+ml-25m/
+*.parquet
+*.npy
+*.index
+*.faiss
+*.pkl
+*.csv
+
+# Environments and caches
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# VCS and local-only
+.git/
+.env
+docs/
+'@
