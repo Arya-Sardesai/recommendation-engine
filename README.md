@@ -108,6 +108,23 @@ The live demo is the easiest way to try it. To run the serving app locally you'l
 python -m streamlit run app.py
 ```
 
+
+## Reproducing the pipeline
+
+The data pipeline (corpus build → tagging → embedding → evaluation) is
+documented as `make` targets — see the [Makefile](Makefile) for the stage
+graph and required raw data. A containerized environment is provided:
+
+```bash
+docker build -t rec-engine-pipeline .
+docker run -it --rm -v "$(pwd)":/work rec-engine-pipeline
+make movies-corpus   # e.g.
+```
+
+Raw source dumps (TMDB, MovieLens, Goodreads) are not versioned; the
+Makefile header lists what goes where. Embedding runs on GPU on the host
+in practice; the container runs everything on CPU.
+
 ## Data & acknowledgements
 
 Built on public datasets: Goodreads and the Hardcover API (books); TMDB and IMDb non-commercial data (films); TMDB (TV); and MovieLens ml-25m (ratings and genome tags used for evaluation and film tagging). Each source retains its own license and terms — this project uses them for a non-commercial personal/portfolio tool. Embedding model: BAAI/bge-m3.
