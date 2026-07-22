@@ -1,10 +1,11 @@
-cat > .gitignore << 'EOF'
 # Data
 data/
 *.parquet
 *.faiss
 *.pkl
 *.npy
+*.csv
+ml-25m/
 
 # Python
 __pycache__/
@@ -26,8 +27,3 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
-EOF
-
-ml-25m/
-*.csv
-*.txt
