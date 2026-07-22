@@ -4,6 +4,7 @@ A content-based recommender that works across **books, films, and TV** from a si
 
 **Live demo:** [huggingface.co/spaces/Arya2305/recommendation-engine](https://huggingface.co/spaces/Arya2305/recommendation-engine)
 
+![App screenshot](docs/screenshot.png)
 ---
 
 ## Overview
