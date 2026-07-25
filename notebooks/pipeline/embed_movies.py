@@ -15,6 +15,23 @@ WHAT'S SET HERE
   prefix needed -- every film is embedded as plain text, which is the item<->item
   case. Normalizes cleanly, so IndexFlatIP == cosine still holds.
 
+*** KEYWORD COLUMN (changed -- read this) ***
+The TMDB bulk enrichment wrote fresh keywords to `keywords_tmdb`. The legacy
+Kaggle `keywords` column still exists in the parquet and is STALE (2023 dump,
+pre-rename location vocabulary: "london" vs TMDB's "london, england").
+This script previously read `keywords` and would have silently embedded stale
+tags under a `v2_kw` artifact name -- no error, no warning. KW_COL is now
+explicit and MISSING IT IS A HARD FAILURE. Do not add a fallback.
+
+Union with the legacy column was measured and rejected: only 767 films (0.7% of
+corpus) have keywords in the Kaggle column but not in TMDB's, and the two
+vocabularies disagree on location naming, so a union would split concepts across
+two tokens.
+
+Stoplist lives in kw_common.py (shared with embed_tv.py) so movies and TV cannot
+drift apart. See that file for why "based on novel or book" is KEPT and
+"woman director" is STRIPPED.
+
 8GB-CARD NOTES (why these aren't MiniLM's numbers)
 --------------------------------------------------
 BGE-M3 is ~15x heavier than MiniLM. To fit the RTX 4060 (8GB):
@@ -40,6 +57,8 @@ import faiss
 from sentence_transformers import SentenceTransformer
 import torch
 
+from kw_common import KW_STOP, to_terms as _to_terms
+
 ROOT = Path(__file__).parent.parent.parent
 PROCESSED_DIR = ROOT / "data" / "processed"
 CORPUS = PROCESSED_DIR / "movies.parquet"
@@ -47,50 +66,23 @@ CORPUS = PROCESSED_DIR / "movies.parquet"
 # ---- experiment knobs --------------------------------------------------------
 MODEL_NAME = "BAAI/bge-m3"          # Lever B multilingual; was all-MiniLM-L6-v2
 EMBED_VARIANT = "v2_kw"             # overview | rich_v1 | v2_kw | v2_kw_people
-KW_MAX = 20                         # cap keywords folded in (TMDB ~orders by relevance)
+KW_COL = "keywords_tmdb"            # HARD REQUIREMENT -- see docstring. No fallback.
+KW_MAX = 20                         # cap keywords folded in (p90 is 13, so rarely binds)
 CAST_MAX = 4                        # _people arm only: top-billed cast to append
 ENCODE_BATCH = 32                   # BGE-M3 on 8GB; drop to 16 if you OOM
 MAX_SEQ_LEN = 512                   # film text is short; cap BGE-M3's 8192 default
 USE_FP16 = True                     # halve weight memory on the 4060; flip off if norms drift
 SHARD = 20_000                      # rows per encode() call; caps GPU memory
 
-# Production-meta keyword tokens that carry no thematic meaning -> strip.
-KW_STOP = {
-    "aftercreditsstinger", "duringcreditsstinger", "based on novel or book",
-    "based on comic", "based on young adult novel", "based on true story",
-    "woman director", "sequel", "prequel", "remake", "reboot",
-}
+# Measured coverage on the enriched corpus: 66.7% of films have >=1 keyword.
+# If the observed rate lands far below this, the wrong column is being read.
+KW_COVERAGE_FLOOR = 0.55
 
 # Artifact names are VERSIONED by variant+model so v1 stays live and rollback is
 # just flipping the filename constants in app.py (M_EMB / M_FAISS).
 _MODEL_TAG = MODEL_NAME.split("/")[-1].replace("-", "").lower()[:12]
 OUT_EMB = PROCESSED_DIR / f"movie_embeddings_{_MODEL_TAG}_{EMBED_VARIANT}.npy"
 OUT_FAISS = PROCESSED_DIR / f"movie_faiss_{_MODEL_TAG}_{EMBED_VARIANT}.index"
-
-
-def _to_terms(val, max_n=None, stop=None):
-    """Coerce a comma-string OR an array/list column value into clean terms.
-
-    Handles both the str columns (keywords, genres) and the ndarray columns
-    (cast, directors_all) uniformly. Drops empties / 'nan' / stoplisted tokens.
-    """
-    if val is None:
-        return []
-    if isinstance(val, (list, tuple, np.ndarray)):
-        terms = [str(x).strip() for x in val]
-    else:
-        s = str(val)
-        if s.strip().lower() in ("", "nan"):
-            return []
-        terms = [t.strip() for t in s.split(",")]
-    out = []
-    for t in terms:
-        if not t or t.lower() == "nan":
-            continue
-        if stop and t.lower() in stop:
-            continue
-        out.append(t)
-    return out[:max_n] if max_n else out
 
 
 def build_embed_text(df: pd.DataFrame) -> list[str]:
@@ -114,18 +106,28 @@ def build_embed_text(df: pd.DataFrame) -> list[str]:
     if EMBED_VARIANT not in ("v2_kw", "v2_kw_people"):
         raise SystemExit(f"Unknown EMBED_VARIANT: {EMBED_VARIANT!r}")
 
+    # --- fail loud on the wrong keyword column ------------------------------
+    if KW_COL not in df.columns:
+        raise SystemExit(
+            f"ERROR: required keyword column {KW_COL!r} not in corpus.\n"
+            f"  Present columns: {list(df.columns)}\n"
+            f"  Run the TMDB merge before embedding. Do NOT fall back to the\n"
+            f"  legacy 'keywords' column -- it is stale and uses pre-rename\n"
+            f"  location vocabulary."
+        )
+
     # ---- v2: title dropped, overview leads, keywords + genres carry theme ----
     want_people = EMBED_VARIANT == "v2_kw_people"
     has = lambda c: c in df.columns
 
     overview = df["overview"].fillna("").astype(str).tolist()
-    keywords = df["keywords"].tolist() if has("keywords") else [None] * len(df)
+    keywords = df[KW_COL].tolist()
     genres = df["genres"].tolist() if has("genres") else [None] * len(df)
     directors = df["directors_all"].tolist() if has("directors_all") else (
         df["director"].tolist() if has("director") else [None] * len(df))
     cast = df["cast"].tolist() if has("cast") else [None] * len(df)
 
-    texts = []
+    texts, n_with_kw = [], 0
     for i in range(len(df)):
         parts = []
         ov = overview[i].strip()
@@ -134,6 +136,7 @@ def build_embed_text(df: pd.DataFrame) -> list[str]:
         kw = _to_terms(keywords[i], max_n=KW_MAX, stop=KW_STOP)
         if kw:
             parts.append(f"Themes: {', '.join(kw)}.")
+            n_with_kw += 1
         gens = _to_terms(genres[i])
         if gens:
             parts.append(f"Genres: {', '.join(gens)}.")
@@ -145,6 +148,18 @@ def build_embed_text(df: pd.DataFrame) -> list[str]:
             if cst:
                 parts.append(f"Starring {', '.join(cst)}.")
         texts.append(" ".join(parts).strip())
+
+    # --- coverage guard: catches a wrong-but-present column, and catches an
+    # over-aggressive stoplist, before 25 minutes of GPU time are spent.
+    rate = n_with_kw / max(len(df), 1)
+    print(f"Keyword coverage in embed text: {n_with_kw:,}/{len(df):,} ({rate:.1%}) "
+          f"from column {KW_COL!r}")
+    if rate < KW_COVERAGE_FLOOR:
+        raise SystemExit(
+            f"ERROR: keyword coverage {rate:.1%} is below the {KW_COVERAGE_FLOOR:.0%} "
+            f"floor.\n  Either the wrong column is being read or KW_STOP is eating "
+            f"real signal.\n  Investigate before burning GPU time."
+        )
     return texts
 
 
@@ -154,7 +169,7 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Embedding on: {device}")
-    print(f"Model: {MODEL_NAME}  |  Variant: {EMBED_VARIANT}")
+    print(f"Model: {MODEL_NAME}  |  Variant: {EMBED_VARIANT}  |  kw_col: {KW_COL}")
     print(f"batch={ENCODE_BATCH}  max_seq_len={MAX_SEQ_LEN}  fp16={USE_FP16 and device=='cuda'}")
 
     df = pd.read_parquet(CORPUS)
