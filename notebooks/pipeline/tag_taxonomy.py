@@ -36,7 +36,7 @@ UNIVERSAL_TAGS = {
     # --- mood ---
     "dark", "hopeful", "melancholic", "humorous", "bleak", "feel-good",
     "tense", "whimsical", "eerie", "atmospheric", "witty", "comfort-read",
-    "heart-wrenching", "meditative", "thought-provoking",
+    "heart-wrenching", "meditative", "thought-provoking", "emotionally-heavy",
     # --- experience / pace ---
     "slow-burn", "fast-paced", "mind-bending", "tearjerker",
         "twist-ending", "page-turner", "immersive", "accessible",
@@ -60,7 +60,7 @@ BOOK_ONLY_TAGS = {
     "unreliable-narrator", "first-person", "second-person", "multiple-povs",
     "omniscient", "epistolary", "stream-of-consciousness", "framed-narrative",
     "literary-prose", "lyrical", "dense", "dialogue-heavy",                      # ?? 'non-linear' structure vs UNIVERSAL 'twist-ending' -- distinct, keep both
-    "slow-burn-romance",                                 # ?? romance pacing; could collapse into 'romance'+'slow-burn'
+    "slow-burn-romance", "dual-timeline",                                # ?? romance pacing; could collapse into 'romance'+'slow-burn'
     "single-sitting",
     "contemporary-realism", "soft-magic", "hard-magic",  # ?? magic-system tags: book-only or move to UNIVERSAL fantasy?
 }

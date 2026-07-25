@@ -59,6 +59,7 @@ PRICE_IN, PRICE_CACHE_READ, PRICE_CACHE_WRITE, PRICE_OUT = 1.00, 0.10, 1.25, 5.0
 # lowercasing are handled generically in canon(); this dict is for true synonyms.
 ALIASES = {
     "emotional-heavy": "emotionally-heavy",
+    "emotional-heavy" → "emotionally-heavy"
     "mystery-adjacent": "mystery",
     "philosophical": "thought-provoking",   # soft synonym; delete this line to drop instead
     "comedic": "humorous",
