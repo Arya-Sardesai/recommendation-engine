@@ -7,7 +7,10 @@ import numpy as np
 import pandas as pd
 import faiss
 
-src = open("app.py").read()
+from pathlib import Path
+APP_PY = Path(__file__).resolve().parents[1].parent / "hf-space" / "app.py"
+src = open(APP_PY, encoding="utf-8").read()
+
 tree = ast.parse(src)
 wanted = {"LANG_NAMES", "_TITLE_STOPWORDS"}
 wanted_funcs = {"lang_label", "_title_tokens", "_is_title_dup", "_creator_names",
