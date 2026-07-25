@@ -56,7 +56,7 @@ from tag_taxonomy import (  # noqa: E402
 )
 
 # ---- config -----------------------------------------------------------------
-AUDIT_ONLY = True          # False = actually write the parquets
+AUDIT_ONLY = False          # False = actually write the parquets
 MAX_TAGS_PER_ITEM = 10     # was 7; see docstring
 N_SAMPLES = 8              # sample titles printed per tag
 
