@@ -53,14 +53,19 @@ KW_STOP = {
     "spin off",
     "spinoff",
 
-    # --- TMDB mood vocabulary (affect labels, not subject matter) ---
-    # NOTE: this set is from the pilot frequency tables and is probably
-    # INCOMPLETE. Sweep the full tables before the re-embed:
-    #   Select-String -Path data\tmdb_raw\kw_freq_movies.csv `
-    #     -Pattern "^(amused|gloomy|joyous|angry|sad|happy|tense|calm)," 
-    "amused",
-    "gloomy",
-    "joyous",
+    # --- TMDB affect vocabulary: VIEWER-REACTION half only ---
+    # Swept against the full frequency tables (not the pilot). These describe
+    # how the viewer feels and are near-redundant with genre -- a comedy
+    # amuses you; Comedy already says so.
+    # The artifact-TONE half is DELIBERATELY KEPT: melancholic/whimsical/
+    # lighthearted/suspenseful/depressing/tense/nostalgic/gloomy/joyous cut
+    # ACROSS genre (a whimsical horror film is a real, distinctive thing) and
+    # are the closest the folksonomy gets to a tone signal. NOTE this reverses
+    # two of the three examples in the old handoff: only "amused" is stripped.
+    "amused",        # 429 movies / 140 TV -- most common of the set
+    "angry", "anxious", "excited", "curious", "disgusted",
+    "frustrated", "sympathetic", "relaxed", "hopeful",
+    "scared", "sad", "happy", "bored",
 }
 
 # Deliberately NOT stopped (documented so nobody "fixes" this later):

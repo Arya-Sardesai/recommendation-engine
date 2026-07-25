@@ -89,7 +89,7 @@ GENOME_MAP = {
     "tearjerker": ["tear jerker", "heartbreaking", "emotional"],
     "atmospheric": ["atmospheric", "moody", "stylish"],
     "twist-ending": ["twist ending", "plot twist", "surprise ending", "twist"],
-    "nonlinear": ["nonlinear", "non-linear", "multiple storylines"],
+    "non-linear": ["nonlinear", "non-linear", "multiple storylines"],
 
     # --- relationships / conflict ---
     "found-family": ["friendship", "family", "family bonds"],

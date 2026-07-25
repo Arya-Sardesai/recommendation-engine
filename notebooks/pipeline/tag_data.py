@@ -63,6 +63,7 @@ ALIASES = {
     "philosophical": "thought-provoking",   # soft synonym; delete this line to drop instead
     "comedic": "humorous",
     "suspenseful": "tense",
+    "satirical": "satire",
 }
 
 VOCAB = set(ALL_BOOK_TAGS)
