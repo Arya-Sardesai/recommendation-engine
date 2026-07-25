@@ -460,7 +460,7 @@ TOOLS = [
     },
     {
         "name": "search_by_tags",
-        "description": "Search films by quality-tags (NOT genres). Returns films from the tagged subset (~13.5K popular films) scoring high on positive tags and optionally low on negative tags. Use for qualities like 'slow-burn crime', 'mind-bending nonlinear', 'feel-good with found-family', 'stylish revenge without romance'. Available tags span pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical, tense, bleak, hopeful, feel-good), experience (mind-bending, twist-ending, nonlinear, tearjerker), themes (coming-of-age, revenge, redemption, survival, found-family, forbidden-love, political), and genre-ish (science-fiction, dystopian, cyberpunk, time-travel, space-opera, climate-fiction, horror, thriller, crime, war, satire) plus movie-specific (visually-stunning, stylized-violence, ensemble-cast, animation, musical). Returns each film's top contributing tags. Only ~13.5K films are tagged — if results are weak, fall back to search_catalog_semantic.",
+        "description": "Search films by quality-tags (NOT genres). Returns films from the tagged subset (~13.5K popular films) scoring high on positive tags and optionally low on negative tags. Use for qualities like 'slow-burn crime', 'mind-bending nonlinear', 'feel-good with found-family', 'stylish revenge without romance'. Available tags span pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical, tense, bleak, hopeful, feel-good), experience (mind-bending, twist-ending, non-linear, tearjerker), themes (coming-of-age, revenge, redemption, survival, found-family, forbidden-love, political), and genre-ish (science-fiction, dystopian, cyberpunk, time-travel, space-opera, climate-fiction, horror, thriller, crime, war, satire) plus movie-specific (visually-stunning, stylized-violence, ensemble-cast, animation, musical). Returns each film's top contributing tags. Only ~13.5K films are tagged — if results are weak, fall back to search_catalog_semantic.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -540,7 +540,7 @@ Decide which path the request needs:
 3. Call search_catalog_semantic with a query combining the requested genre + those qualities. e.g. "horror with stylish tension and a twist".
 4. Present picks by EXPLICITLY BRIDGING: "You rated [film] highly for [quality] — here's a horror film with that same [quality]." Don't just dump genre results; show why these fit them.
 
-**Path C — request is QUALITY-based** (e.g. "mind-bending nonlinear films", "slow-burn revenge", "feel-good found-family"):
+**Path C — request is QUALITY-based** (e.g. "mind-bending non-linear films", "slow-burn revenge", "feel-good found-family"):
 1. Use search_by_tags with positive_tags for the qualities, optionally negative_tags to avoid.
 2. Cross-reference with their taste — note which returned films share tags with what they rated highly.
 3. Explain picks by referencing the specific tags.
