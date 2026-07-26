@@ -5,6 +5,7 @@ The agent (Claude) is given tools that wrap the existing recommender. It can:
   - inspect the user's ratings (semantic search over what they've rated)
   - get recommendations from anchor books, with optional year filters
   - look up books in the catalog
+  - search by quality-tags across the near-full catalog (LLM + kNN-propagated)
 
 It runs an agentic loop: Claude decides which tools to call, we execute them,
 feed results back, and Claude continues until it produces a final answer.
@@ -216,55 +217,79 @@ def _tool_search_catalog_semantic(state, query, limit=15, min_year=None, max_yea
     }
 
 def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15, min_year=None, max_year=None):
-    """Search the tagged subset by quality-tags. Returns books scoring high on positive
-    tags and low on negative tags. Only works for the ~33K books that have been tagged."""
+    """Search by quality-tags across the FULL catalog: LLM tags (~33K books,
+    weight 1.0) + kNN-propagated tags (~397K books, weight 0.5). Propagated
+    tags are inference (holdout precision 0.541), so they rank lower and are
+    marked as inferred in the output."""
     df = state["df"]
     ratings = state["ratings"]
-    
-    # Lazy-load the tags dataframe on first call
+
+    KNN_WEIGHT = 0.5
+
     if "tags_df" not in state:
         from pathlib import Path
-        tags_path = Path("data/processed/book_tags.parquet")
-        if not tags_path.exists():
+        llm_path = Path("data/processed/book_tags.parquet")
+        knn_path = Path("data/processed/book_tags_knn.parquet")
+        if not llm_path.exists():
             return {"results": [], "note": "No tag data available."}
-        tdf = pd.read_parquet(tags_path)
-        # Pivot to wide: rows=book_id, cols=tag, values=score
-        state["tags_df"] = tdf.pivot_table(
+        llm = pd.read_parquet(llm_path)
+        llm["source"] = "llm"
+        llm["book_id"] = llm["book_id"].astype(str)
+        if knn_path.exists():
+            knn = pd.read_parquet(knn_path)[["book_id", "tag", "score"]]
+            knn["source"] = "knn"
+            knn["book_id"] = knn["book_id"].astype(str)
+            knn["score"] = knn["score"] * KNN_WEIGHT
+            both = pd.concat([llm, knn], ignore_index=True)
+            # LLM wins on any (book_id, tag) collision. Make the priority
+            # EXPLICIT rather than relying on alphabetical accident:
+            both["_prio"] = (both["source"] == "llm").astype(int)
+            both = (both.sort_values("_prio")
+                        .drop_duplicates(subset=["book_id", "tag"], keep="last")
+                        .drop(columns="_prio"))
+        else:
+            both = llm
+        state["tags_df"] = both.pivot_table(
             index="book_id", columns="tag", values="score", fill_value=0.0
-        )
+        ).astype("float32")
+        # (book_id, tag) -> source, for marking inferred tags in output
+        state["tag_source"] = {(str(b), t): s for b, t, s in
+                               zip(both.book_id, both.tag, both.source)}
+        # book_id -> positional row, so ranked iteration isn't O(n) per lookup
+        state["bookid_pos"] = {str(b): i for i, b in enumerate(df["book_id"])}
+
     tags_df = state["tags_df"]
-    
+    tag_source = state["tag_source"]
+    bookid_pos = state["bookid_pos"]
+
     positive_tags = positive_tags or []
     negative_tags = negative_tags or []
-    
-    # Validate tags exist
     available = set(tags_df.columns)
     pos = [t for t in positive_tags if t in available]
     neg = [t for t in negative_tags if t in available]
     invalid = [t for t in positive_tags + negative_tags if t not in available]
-    
+
     if not pos and not neg:
         return {"results": [], "note": f"None of those tags exist. Available tags include: {sorted(available)[:30]}..."}
-    
-    # Score: sum of positive tag scores - sum of negative tag scores
+
     score = tags_df[pos].sum(axis=1) if pos else pd.Series(0.0, index=tags_df.index)
     if neg:
         score = score - tags_df[neg].sum(axis=1)
-    
-    # Sort, filter out already-rated, apply year filters
-    rated_ids = {r["book_id"] for r in ratings}
+
+    rated_ids = {str(r["book_id"]) for r in ratings}
     rated_authors = {r.get("matched_author", "").lower() for r in ratings if r.get("matched_author")}
-    
     ranked = score.sort_values(ascending=False)
-    
+
     results = []
     for book_id, s in ranked.items():
-        if str(book_id) in {str(rid) for rid in rated_ids}:
+        if s <= 0:
+            break                      # scores only fall from here; nothing left
+        if str(book_id) in rated_ids:
             continue
-        row = df[df["book_id"].astype(str) == str(book_id)]
-        if row.empty:
+        pos_ix = bookid_pos.get(str(book_id))
+        if pos_ix is None:
             continue
-        b = row.iloc[0]
+        b = df.iloc[pos_ix]
         if b["primary_author"].lower() in rated_authors:
             continue
         if b["ratings_count"] < 2000:
@@ -274,12 +299,12 @@ def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15
             continue
         if max_year is not None and (pd.isna(yr) or yr > max_year):
             continue
-        
-        # Show which tags drove the score
-        book_tags = tags_df.loc[book_id]
-        top_tags = book_tags.nlargest(5)
-        top_tags = [(t, round(float(v), 2)) for t, v in top_tags.items() if v > 0]
-        
+
+        book_tags = tags_df.loc[book_id].nlargest(5)
+        top_tags = [(t + (" (inferred)" if tag_source.get((str(book_id), t)) == "knn" else ""),
+                     round(float(v), 2))
+                    for t, v in book_tags.items() if v > 0]
+
         results.append({
             "title": b["title"],
             "author": b["primary_author"],
@@ -289,13 +314,15 @@ def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15
         })
         if len(results) >= limit:
             break
-    
+
     return {
         "positive_tags_used": pos,
         "negative_tags_used": neg,
         "invalid_tags": invalid,
         "results": results,
-        "note": f"Searched {len(tags_df):,} tagged books. Tagged subset is ~33K books (>=10K ratings) — not the full catalog.",
+        "note": (f"Searched {len(tags_df):,} tagged books (near-full catalog). "
+                 "Tags marked (inferred) come from embedding-neighbour propagation "
+                 "and are less certain than unmarked LLM-assigned tags."),
     }
 
 
@@ -338,42 +365,42 @@ TOOLS = [
             "required": ["query"],
         },
     },
-        {
-    "name": "search_catalog_semantic",
-    "description": "Semantic search across the ENTIRE catalog by free-text query (genre + qualities). Use this when the user asks for a genre they haven't rated in (e.g. they ask for cyberpunk but their ratings are all literary fiction). The right pattern: first look at their ratings to infer qualities they enjoy (twists, character-driven, witty, fast-paced, etc.), then call this with a query combining the requested genre AND those qualities — e.g. 'cyberpunk with literary depth and character focus'. Excludes books they've rated and authors they've read.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Free-text query combining the requested genre with qualities from the user's taste. e.g. 'cyberpunk with twists and witty dialogue'."},
-            "limit": {"type": "integer", "description": "How many results to return (default 15)."},
-            "min_year": {"type": "integer"},
-            "max_year": {"type": "integer"},
+    {
+        "name": "search_catalog_semantic",
+        "description": "Semantic search across the ENTIRE catalog by free-text query (genre + qualities). Use this when the user asks for a genre they haven't rated in (e.g. they ask for cyberpunk but their ratings are all literary fiction). The right pattern: first look at their ratings to infer qualities they enjoy (twists, character-driven, witty, fast-paced, etc.), then call this with a query combining the requested genre AND those qualities — e.g. 'cyberpunk with literary depth and character focus'. Excludes books they've rated and authors they've read.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Free-text query combining the requested genre with qualities from the user's taste. e.g. 'cyberpunk with twists and witty dialogue'."},
+                "limit": {"type": "integer", "description": "How many results to return (default 15)."},
+                "min_year": {"type": "integer"},
+                "max_year": {"type": "integer"},
+            },
+            "required": ["query"],
         },
-        "required": ["query"],},
     },
     {
-    "name": "search_by_tags",
-    "description": "Search books by quality-tags (NOT genres). Returns books from the tagged subset (~33K popular books) scoring high on positive tags and optionally low on negative tags. Use when the user asks for specific qualities like 'books with unreliable narrators,' 'slow-burn dark academia,' 'fast-paced sci-fi without romance,' etc. Available tags include pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical), narrator (unreliable-narrator, first-person, multiple-povs), structure (non-linear, epistolary, dual-timeline), style (literary-prose, witty, lyrical, satire), themes (coming-of-age, grief, identity, found-family, legacy, hubris), experience (page-turner, thought-provoking, mind-bending, comfort-read), and genres (high-fantasy, urban-fantasy, dark-academia, science-fiction, cyberpunk, dystopian, space-opera, climate-fiction, time-travel). Returns books with each book's top contributing tags for explanation. Note: only ~33K books (the >=10K-rating subset) have tags, so this won't cover the full catalog.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "positive_tags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Tags the book SHOULD score high on."
+        "name": "search_by_tags",
+        "description": "Search books by quality-tags (NOT genres). Covers nearly the FULL catalog: ~33K popular books carry high-confidence LLM-assigned tags, and ~397K more carry inferred tags propagated from embedding neighbours (marked '(inferred)' in results, ranked lower). Use when the user asks for specific qualities like 'books with unreliable narrators,' 'slow-burn dark academia,' 'fast-paced sci-fi without romance,' etc. Available tags include pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical), narrator (unreliable-narrator, first-person, multiple-povs), structure (non-linear, epistolary, dual-timeline), style (literary-prose, witty, lyrical, satire), themes (coming-of-age, grief, identity, found-family, legacy, hubris), experience (page-turner, thought-provoking, mind-bending, comfort-read), and genres (high-fantasy, urban-fantasy, dark-academia, science-fiction, cyberpunk, dystopian, space-opera, climate-fiction, time-travel). Returns books with each book's top contributing tags for explanation. Inferred tags are reliable for broad qualities (dark, romance, thriller, psychological) and weak for rare structural ones (epistolary, second-person, time-loop) — for those, results will skew to the LLM-tagged subset, which is correct.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "positive_tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tags the book SHOULD score high on."
+                },
+                "negative_tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Tags the book should score LOW on (for excluding qualities)."
+                },
+                "limit": {"type": "integer"},
+                "min_year": {"type": "integer"},
+                "max_year": {"type": "integer"},
             },
-            "negative_tags": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Tags the book should score LOW on (for excluding qualities)."
-            },
-            "limit": {"type": "integer"},
-            "min_year": {"type": "integer"},
-            "max_year": {"type": "integer"},
         },
     },
-},
-
 ]
 
 TOOL_IMPLS = {
@@ -387,11 +414,12 @@ TOOL_IMPLS = {
 SYSTEM_PROMPT = """You are a thoughtful book recommendation assistant. You help the user find books to read based on their taste and their requests.
 
 You are strictly a book recommendation assistant. If the user asks for anything unrelated to books or reading (general questions, code, advice on other topics), politely redirect them: "I'm focused on book recommendations — what kind of book are you in the mood for?"
-You have four tools:
+You have five tools:
 - search_user_ratings: inspect what the user has rated, with optional semantic query
 - get_recommendations: find books similar to anchor books they've rated (best when their taste matches the request)
 - search_catalog: look up a specific title
 - search_catalog_semantic: search the WHOLE catalog by free-text (genre + qualities), use when the user asks for something outside their rated taste
+- search_by_tags: search by quality-tags across nearly the full catalog
 
 Decide which path the request needs:
 
@@ -410,7 +438,7 @@ Decide which path the request needs:
 1. Use search_by_tags with positive_tags listing the qualities, optionally negative_tags for things to avoid.
 2. Cross-reference with the user's taste — note which returned books have tags that overlap with what they've rated highly.
 3. Explain the picks by referencing the specific tags ("This scores high on unreliable-narrator and atmospheric, both qualities you rated highly in X").
-4. Note that this only searches the ~33K tagged subset — if results are weak, fall back to search_catalog_semantic.
+4. Tag search now covers nearly the full catalog. Unmarked tags are high-confidence; tags marked (inferred) are propagated and less certain — when a pick rests mainly on inferred tags, soften the claim ("this looks like a slow-burn dark academia pick") rather than asserting it. If results are weak, fall back to search_catalog_semantic.
 
 You can also COMBINE paths: for "cyberpunk with witty dialogue," call search_by_tags with positive=[cyberpunk, witty, dialogue-heavy], then explain bridges to the user's taste.
 
@@ -496,7 +524,11 @@ def run_agent(user_message, state, conversation_history=None, max_turns=6, verbo
     history = conversation_history or []
     history = history + [{"role": "user", "content": user_message}]
 
-    seen_titles = set()  # every book title any tool returned this turn
+    # Conversation-scoped, not turn-scoped. The grounding rule says "in THIS
+    # conversation", and a follow-up like "tell me about the third one" makes
+    # no tool calls -- with a per-turn reset it flagged the answer as a
+    # hallucination. Lives on `state` so it survives across messages.
+    seen_titles = state.setdefault("_seen_titles", set())
 
     for turn in range(max_turns):
         resp = client.messages.create(

@@ -8,6 +8,11 @@ Run locally:  streamlit run src/app_agent.py
 Requires:  $env:ANTHROPIC_API_KEY = "sk-ant-..."  (set before launching)
 Reads local data from data/processed/ (the v1 artifacts).
 """
+import os
+import warnings
+os.environ["TRANSFORMERS_VERBOSITY"] = "error"   # silence the __path__ deprecation flood
+warnings.filterwarnings("ignore", message=".*__path__.*")
+
 from pathlib import Path
 import json
 import sys
@@ -92,6 +97,7 @@ def clear_all():
     st.session_state.ratings = []
     st.session_state.chat = []
     st.session_state.agent_history = []
+    st.session_state.agent_state = {}   # drops caches + seen-titles ledger
 
 
 df, embeddings, index = load_all()
@@ -102,6 +108,11 @@ if "chat" not in st.session_state:
     st.session_state.chat = []  # list of {"role","content"} for display
 if "agent_history" not in st.session_state:
     st.session_state.agent_history = []  # full message history for the agent (multi-turn memory)
+if "agent_state" not in st.session_state:
+    # PERSISTENT across messages: holds the lazily-loaded BGE-M3 query encoder,
+    # the merged tag pivot, and the conversation-scoped seen-titles ledger.
+    # Rebuilding this per message reloaded 568M params on every question.
+    st.session_state.agent_state = {}
 
 st.title("Recommendation Engine")
 st.caption(f"{len(df):,} books · rate books on the left, ask the agent on the right")
@@ -167,8 +178,9 @@ with right:
                 st.markdown(prompt)
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    state = {"df": df, "embeddings": embeddings, "index": index,
-                             "ratings": st.session_state.ratings}
+                    state = st.session_state.agent_state
+                    state.update({"df": df, "embeddings": embeddings, "index": index,
+                                  "ratings": st.session_state.ratings})
                     try:
                         reply, st.session_state.agent_history = run_agent(
                             prompt, state,

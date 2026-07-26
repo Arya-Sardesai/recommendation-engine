@@ -248,11 +248,12 @@ def _tool_search_catalog_semantic(state, query, limit=15, min_year=None, max_yea
 
 def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15,
                          min_year=None, max_year=None):
-    """Search the tagged subset (~13.5K films) by quality-tags."""
+    """Search the tagged subset (~44K films, 40% of catalog) by quality-tags.
+    Source: movie_tags_v2.parquet = genome-derived tags UNION TMDB-keyword tags."""
     df = state["df"]; ratings = state["ratings"]
 
     if "tags_df" not in state:
-        tags_path = Path("data/processed/movie_tags.parquet")
+        tags_path = Path("data/processed/movie_tags_v2.parquet")
         if not tags_path.exists():
             return {"results": [], "note": "No tag data available."}
         tdf = pd.read_parquet(tags_path)
@@ -313,7 +314,7 @@ def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15
 
     return {"positive_tags_used": pos, "negative_tags_used": neg,
             "invalid_tags": invalid, "results": results,
-            "note": f"Searched {len(tags_df):,} tagged films (~13.5K subset, not the full catalog)."}
+            "note": f"Searched {len(tags_df):,} tagged films (~44K, 40% of catalog: genome + TMDB-keyword tags)."}
 
 
 def _tool_search_by_people(state, person, role="any", limit=15):
@@ -460,7 +461,7 @@ TOOLS = [
     },
     {
         "name": "search_by_tags",
-        "description": "Search films by quality-tags (NOT genres). Returns films from the tagged subset (~13.5K popular films) scoring high on positive tags and optionally low on negative tags. Use for qualities like 'slow-burn crime', 'mind-bending nonlinear', 'feel-good with found-family', 'stylish revenge without romance'. Available tags span pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical, tense, bleak, hopeful, feel-good), experience (mind-bending, twist-ending, non-linear, tearjerker), themes (coming-of-age, revenge, redemption, survival, found-family, forbidden-love, political), and genre-ish (science-fiction, dystopian, cyberpunk, time-travel, space-opera, climate-fiction, horror, thriller, crime, war, satire) plus movie-specific (visually-stunning, stylized-violence, ensemble-cast, animation, musical). Returns each film's top contributing tags. Only ~13.5K films are tagged — if results are weak, fall back to search_catalog_semantic.",
+        "description": "Search films by quality-tags (NOT genres). Returns films from the tagged subset (~44K films, 40% of catalog) scoring high on positive tags and optionally low on negative tags. Use for qualities like 'slow-burn crime', 'mind-bending nonlinear', 'feel-good with found-family', 'stylish revenge without romance'. Available tags span pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical, tense, bleak, hopeful, feel-good), experience (mind-bending, twist-ending, non-linear, tearjerker), themes (coming-of-age, revenge, redemption, survival, found-family, forbidden-love, political), and genre-ish (science-fiction, dystopian, cyberpunk, time-travel, space-opera, climate-fiction, horror, thriller, crime, war, satire) plus movie-specific (visually-stunning, stylized-violence, ensemble-cast, animation, musical), source-medium (book-adaptation, comic-adaptation, manga-adaptation, game-adaptation), and sub-genres (superhero, noir, sports, martial-arts, biographical, true-crime, supernatural, heist, queer-rep, grief, slice-of-life, short-film). Returns each film's top contributing tags. Only ~44K films (40%) are tagged — if results are weak, fall back to search_catalog_semantic.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -523,7 +524,7 @@ You have seven tools:
 - get_recommendations: find films similar to anchor films they've rated (best when their taste matches the request); supports year + language filters
 - search_catalog: look up a specific title
 - search_catalog_semantic: search the WHOLE catalog by free-text (genre + qualities), with optional language filter — use for requests outside their rated taste
-- search_by_tags: search the ~13.5K tagged films by quality-tags (pace, mood, themes, structure)
+- search_by_tags: search the ~44K tagged films by quality-tags (pace, mood, themes, structure, source medium, sub-genre)
 - search_by_people: find films by a director or actor (auteur / star following)
 - search_by_studio: find films from a studio (A24, Blumhouse, Ghibli, ...)
 
@@ -544,7 +545,7 @@ Decide which path the request needs:
 1. Use search_by_tags with positive_tags for the qualities, optionally negative_tags to avoid.
 2. Cross-reference with their taste — note which returned films share tags with what they rated highly.
 3. Explain picks by referencing the specific tags.
-4. Only ~13.5K films are tagged — if results are weak, fall back to search_catalog_semantic.
+4. ~44K films (40%) are tagged — if results are weak, fall back to search_catalog_semantic.
 
 **Path D — request is PEOPLE or STUDIO based** (e.g. "movies by Bong Joon-ho", "films with Denzel Washington", "more A24"):
 1. Use search_by_people (set role to director/actor/any) or search_by_studio.
@@ -643,7 +644,11 @@ def run_agent(user_message, state, conversation_history=None, max_turns=6, verbo
     history = conversation_history or []
     history = history + [{"role": "user", "content": user_message}]
 
-    seen_titles = set()  # every film title any tool returned this turn
+    # Conversation-scoped, not turn-scoped. The grounding rule says "in THIS
+    # conversation", and a follow-up like "tell me about the third one" makes
+    # no tool calls -- with a per-turn reset it flagged the answer as a
+    # hallucination. Lives on `state` so it survives across messages.
+    seen_titles = state.setdefault("_seen_titles", set())
 
     for turn in range(max_turns):
         resp = client.messages.create(
