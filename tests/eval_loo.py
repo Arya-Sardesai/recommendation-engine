@@ -54,7 +54,7 @@ PROCESSED = Path("data/processed")
 CORPUS_PATH = PROCESSED / "movies.parquet"
 EMB_PATH = PROCESSED / "movie_embeddings_bgem3_v2_kw.npy"
 FAISS_PATH = PROCESSED / "movie_faiss_bgem3_v2_kw.index"
-TAGS_PATH = PROCESSED / "movie_tags.parquet"          # optional; skipped if absent
+TAGS_PATH = PROCESSED / "movie_tags_v2.parquet"          # optional; skipped if absent
 APP_PY = Path(__file__).resolve().parents[1].parent / "hf-space" / "app.py"   # main/tests -> Poject/hf-space/app.py
 
 LIKE_HOLDOUT = 4.0   # hold out every film rated >= this

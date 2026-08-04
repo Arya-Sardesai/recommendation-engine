@@ -66,7 +66,7 @@ PROCESSED = Path("data/processed")
 CORPUS_PATH = PROCESSED / "movies.parquet"
 EMB_PATH = PROCESSED / "movie_embeddings_bgem3_v2_kw.npy"
 FAISS_PATH = PROCESSED / "movie_faiss_bgem3_v2_kw.index"
-TAGS_PATH = PROCESSED / "movie_tags.parquet"
+TAGS_PATH = PROCESSED / "movie_tags_v2.parquet"
 APP_PY = Path(__file__).resolve().parents[1].parent / "hf-space" / "app.py"
 
 MIN_VOTES = 400
