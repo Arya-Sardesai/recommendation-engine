@@ -65,7 +65,7 @@ CORPUS = PROCESSED_DIR / "movies.parquet"
 
 # ---- experiment knobs --------------------------------------------------------
 MODEL_NAME = "BAAI/bge-m3"          # Lever B multilingual; was all-MiniLM-L6-v2
-EMBED_VARIANT = "v2_kw"             # overview | rich_v1 | v2_kw | v2_kw_people
+EMBED_VARIANT = "v2_kw2"             # overview | rich_v1 | v2_kw | v2_kw_people
 KW_COL = "keywords_tmdb"            # HARD REQUIREMENT -- see docstring. No fallback.
 KW_MAX = 20                         # cap keywords folded in (p90 is 13, so rarely binds)
 CAST_MAX = 4                        # _people arm only: top-billed cast to append
@@ -103,7 +103,7 @@ def build_embed_text(df: pd.DataFrame) -> list[str]:
             texts.append((head + mid + tail).strip())
         return texts
 
-    if EMBED_VARIANT not in ("v2_kw", "v2_kw_people"):
+    if EMBED_VARIANT not in ("v2_kw", "v2_kw2", "v2_kw_people"):
         raise SystemExit(f"Unknown EMBED_VARIANT: {EMBED_VARIANT!r}")
 
     # --- fail loud on the wrong keyword column ------------------------------
