@@ -64,8 +64,8 @@ import faiss
 # ---------------------------------------------------------------------------
 PROCESSED = Path("data/processed")
 CORPUS_PATH = PROCESSED / "movies.parquet"
-EMB_PATH = PROCESSED / "movie_embeddings_bgem3_v2_kw.npy"
-FAISS_PATH = PROCESSED / "movie_faiss_bgem3_v2_kw.index"
+EMB_PATH = PROCESSED / "movie_embeddings_bgem3_v2_kw2.npy"
+FAISS_PATH = PROCESSED / "movie_faiss_bgem3_v2_kw2.index"
 TAGS_PATH = PROCESSED / "movie_tags_v2.parquet"
 APP_PY = Path(__file__).resolve().parents[1].parent / "hf-space" / "app.py"
 
@@ -307,6 +307,7 @@ ABLATIONS = [
     ("full (default)",        None),
     ("flat (no diversity RR)", {"flat_ranking": True}),
     ("no title-token penalty", {"title_token_penalty": 0.0}),
+    ("no tag layer",           {"tag_weight": 0.0}),
     ("no vote_avg floor",      {"min_vote_average": 0.0}),
     ("flat + no penalty/floor", {"flat_ranking": True, "title_token_penalty": 0.0,
                                  "min_vote_average": 0.0}),
