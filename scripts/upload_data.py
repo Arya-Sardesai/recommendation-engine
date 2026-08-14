@@ -42,30 +42,35 @@ LIVE = {
 
 FILES = [
     # --- books ---
-    "books_v1.parquet",
-    "embeddings_minilm_v1.npy",
-    "faiss_minilm_v1.index",
-    "my_matched_ratings.json",
-    "book_tags.parquet",
-    "book_tags_knn.parquet",              # NEW: kNN-propagated, 99.3% coverage
-    "embeddings_bgem3.npy",               # books BGE-M3
-    "faiss_bgem3.index",
-    "embeddings_bgem3_fp16.npy",
+    # "books_v1.parquet",
+    # "embeddings_minilm_v1.npy",
+    # "faiss_minilm_v1.index",
+    # "my_matched_ratings.json",
+    # "book_tags.parquet",
+    # "book_tags_knn.parquet",              # NEW: kNN-propagated, 99.3% coverage
+    # "embeddings_bgem3.npy",               # books BGE-M3
+    # "faiss_bgem3.index",
+    # "embeddings_bgem3_fp16.npy",
+    # --- books v2: Hardcover corpus (current) ---
+    "books_v2_hc.parquet",
+    "book_embeddings_bgem3_v2_hc_notitle.npy",
+    "book_faiss_bgem3_v2_hc_notitle.index",
+    "book_tags_v2_hc.parquet",
     # --- movies ---
-    "movies.parquet",
-    "movie_embeddings_minilm_v1.npy",
-    "movie_faiss_minilm_v1.index",
-    "movie_tags.parquet",                 # genome-only, superseded by v2
-    "movie_tags_v2.parquet",              # NEW: genome + keyword union, 40% coverage
-    "movie_embeddings_bgem3_v2_kw.npy",   # movies BGE-M3
-    "movie_faiss_bgem3_v2_kw.index",
+    # "movies.parquet",
+    # "movie_embeddings_minilm_v1.npy",
+    # "movie_faiss_minilm_v1.index",
+    # "movie_tags.parquet",                 # genome-only, superseded by v2
+    # "movie_tags_v2.parquet",              # NEW: genome + keyword union, 40% coverage
+    # "movie_embeddings_bgem3_v2_kw.npy",   # movies BGE-M3
+    # "movie_faiss_bgem3_v2_kw.index",
     # --- tv ---
-    "tv_corpus.parquet",
-    "tv_tags.parquet",                    # NEW: keyword-derived, 49.9% coverage
-    "tv_embeddings_minilm_v1.npy",
-    "tv_faiss_minilm_v1.index",
-    "tv_embeddings_bgem3_v2_notitle.npy", # tv BGE-M3
-    "tv_faiss_bgem3_v2_notitle.index",
+    # "tv_corpus.parquet",
+    # "tv_tags.parquet",                    # NEW: keyword-derived, 49.9% coverage
+    # "tv_embeddings_minilm_v1.npy",
+    # "tv_faiss_minilm_v1.index",
+    # "tv_embeddings_bgem3_v2_notitle.npy", # tv BGE-M3
+    # "tv_faiss_bgem3_v2_notitle.index",
 ]
 
 args = sys.argv[1:]
