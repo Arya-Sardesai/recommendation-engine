@@ -22,7 +22,8 @@ keeps junk out of a 120K crawl; it is the wrong gate for a hand-curated list,
 where the described record of a real book often has ratings_count 0-1. These
 books sit below app.py's serving floor (min_ratings=10) so they will not be
 RECOMMENDED -- but they can be SEARCHED and RATED, which is the entire point:
-a book only needs an embedding to work as a profile anchor.
+a book only needs an embedding to work as a profile anchor. No ratings gate is
+applied in this script at all; that is deliberate, not an omission.
 
 APPEND-ONLY. New rows go at the end of the parquet, so existing row positions
 (and therefore every corpus_index in every user's localStorage) stay valid.
@@ -33,6 +34,8 @@ USAGE
     python notebooks\\pipeline\\fetch_hardcover_targeted_v2.py --stage fetch
     python notebooks\\pipeline\\fetch_hardcover_targeted_v2.py --stage merge
     python notebooks\\pipeline\\fetch_hardcover_targeted_v2.py --stage merge --write
+
+Run from the REPO ROOT — the paths below are relative to it.
 
 THEN (order matters -- alignment law):
     embed ONLY rows [start_index:] and concatenate to the existing .npy
@@ -77,8 +80,14 @@ BASE_PARQUET = PROCESSED / "books_v2_hc.parquet"
 OUT_PARQUET = PROCESSED / "books_v2_hc2.parquet"
 
 MIN_DESC_CHARS = 100     # same as bulk: below this there is nothing to embed
-MIN_RATINGS = 0          # relaxed: see module docstring
 SLEEP_BETWEEN = 0.35
+
+# Author lookup is an exact string match server-side. If a name is stored
+# differently ("Hussain Zaidi" vs "S. Hussain Zaidi") the query returns nothing
+# and the script prints NOT FOUND -- which means "no author by that exact
+# name", NOT "this author has no books". Set FUZZY_AUTHOR to retry with a
+# case-insensitive contains match before giving up.
+FUZZY_AUTHOR = True
 
 AUTHOR_QUERY = """
 query Targeted($name: String!) {
@@ -104,6 +113,9 @@ query Targeted($name: String!) {
   }
 }
 """
+
+AUTHOR_QUERY_FUZZY = AUTHOR_QUERY.replace(
+    'where: {name: {_eq: $name}}', 'where: {name: {_ilike: $name}}')
 
 
 def headers():
@@ -135,6 +147,25 @@ def run_query(query, variables=None, retries=4):
             print(f"    request failed ({type(e).__name__}: {e}); retry in {wait}s")
             time.sleep(wait)
     return None
+
+
+def fetch_author(name):
+    """Exact name first, then a contains match if that returns nothing."""
+    data = run_query(AUTHOR_QUERY, {"name": name})
+    time.sleep(SLEEP_BETWEEN)
+    if data and data.get("authors"):
+        return data
+    if not FUZZY_AUTHOR:
+        return data
+    # last token is the most stable part of a name across catalogues
+    stem = name.split()[-1]
+    print(f"   exact match failed; retrying on %{stem}%")
+    data = run_query(AUTHOR_QUERY_FUZZY, {"name": f"%{stem}%"})
+    time.sleep(SLEEP_BETWEEN)
+    if data and data.get("authors"):
+        found = [a.get("name") for a in data["authors"]]
+        print(f"   fuzzy matched: {found}")
+    return data
 
 
 # --- verbatim from fetch_hardcover_v2.py so both paths parse identically ----
@@ -199,10 +230,10 @@ def stage_fetch():
         name = target["author"]
         wanted = {_core(t) for t in target["titles"]} if target.get("titles") else None
 
-        data = run_query(AUTHOR_QUERY, {"name": name})
-        time.sleep(SLEEP_BETWEEN)
+        data = fetch_author(name)
         if not data or not data.get("authors"):
-            print(f"{name}: NOT FOUND")
+            print(f"{name}: NOT FOUND "
+                  f"(no author under this name — not proof the books are absent)")
             continue
 
         books, seen = [], set()
@@ -219,6 +250,12 @@ def stage_fetch():
             groups.setdefault(_core(b.get("title") or ""), []).append(b)
 
         print(f"\n=== {name}: {len(books)} records, {len(groups)} distinct works")
+
+        if wanted is not None:
+            unseen = wanted - set(groups)
+            if unseen:
+                print(f"   requested titles with NO record at all: {sorted(unseen)}")
+
         for core, recs in groups.items():
             if wanted is not None and core not in wanted:
                 continue
@@ -254,6 +291,8 @@ def stage_fetch():
     print(f"\nfetch: kept {len(picked)}, skipped {len(rejected)}")
     print(f"  -> {TARGET_RAW}")
     print(f"  -> {TARGET_REJECTS}")
+    print("NOTE: this stage OVERWRITES targeted_raw.jsonl. It is not resumable;")
+    print("      re-running repeats the whole sweep (~30s), which is fine.")
 
 
 def stage_merge(write=False):
@@ -308,9 +347,36 @@ def stage_merge(write=False):
         return
 
     new = pd.DataFrame(rows).drop_duplicates(subset="book_id").reset_index(drop=True)
+
+    # --- schema reconciliation, BEFORE the reindex silently applies it -------
+    # reindex(columns=base.columns) drops any field the base lacks and NaN-fills
+    # any column the row dict does not build. Both are silent. If work_id is in
+    # the dropped list, the KeyError guard this script exists to carry is being
+    # thrown away here, and the failure resurfaces after the upload ritual.
+    built = set(rows[0])
+    base_cols = set(base.columns)
+    dropped = sorted(built - base_cols)
+    filled = sorted(base_cols - built)
+
+    if dropped:
+        raise SystemExit(
+            f"\nthese fields would be DISCARDED by the column reindex: {dropped}\n"
+            f"the base parquet has no such column.\n"
+            f"  - if 'work_id' is listed: add it to the base parquet (and to\n"
+            f"    fetch_hardcover_v2.py's merge rows block) FIRST, or this\n"
+            f"    script's crash fix does nothing.\n"
+            f"  - otherwise drop the field from the row dict above.\n"
+            f"base columns are: {sorted(base_cols)}"
+        )
+    if filled:
+        print(f"\n  WARNING: appended rows will be NaN in {filled}")
+        print("  Check each against the embed step and recommend_books before")
+        print("  --write. A null embed_text on exactly the rows being embedded")
+        print("  produces empty vectors that still pass the alignment asserts.")
+
     new = new.reindex(columns=list(base.columns))   # exact column order
 
-    print(f"appending  : {len(new):,} rows  ({dupes} skipped as already present)")
+    print(f"\nappending  : {len(new):,} rows  ({dupes} skipped as already present)")
     print(f"  with genres  {(new['genres'].str.len() > 0).mean():.0%}")
     print(f"  with moods   {(new['moods'].str.len() > 0).mean():.0%}")
     print(f"  with cover   {(new['image_url'] != '').mean():.0%}")
@@ -318,7 +384,7 @@ def stage_merge(write=False):
           f"(below app.py min_ratings=10 -> ratable as anchors, not recommended)")
     print("\n  appended titles:")
     for _, r in new.iterrows():
-        print(f"    {r['title'][:58]:60s} {r['primary_author'][:26]}")
+        print(f"    {r['title'][:58]:60s} {str(r['primary_author'])[:26]}")
 
     out = pd.concat([base, new], ignore_index=True)
 
@@ -328,6 +394,7 @@ def stage_merge(write=False):
     assert out["book_id"].iloc[:len(base)].tolist() == base["book_id"].tolist(), \
         "existing rows moved — refusing to write"
     assert out["book_id"].is_unique, "duplicate book_id after concat"
+    assert list(out.columns) == list(base.columns), "column set changed"
     print("\n  append-only verified: rows 0..%d unchanged" % (len(base) - 1))
     print(f"  new rows occupy positions {len(base):,}..{len(out) - 1:,}")
     print(f"  EMBED ONLY FROM INDEX {len(base):,} ONWARD")

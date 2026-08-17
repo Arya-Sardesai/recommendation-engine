@@ -11,8 +11,8 @@ worth building. Measure before designing.
 
 WHAT IT DOES
   1. pulls a DEEP ranked candidate pool from the live ranker (flat, caps off)
-  2. buckets candidates by the ranker's own _genre_bucket rule
-  3. takes the top N of each bucket
+  2. runs the FALSIFIER first: is "first genre" real, or just TMDB id order?
+  3. buckets candidates multi-label and by primary genre
   4. reports pairwise Jaccard overlap between buckets
   5. greedily selects buckets that are distinct enough -> "how many tabs does
      this profile actually support?"
@@ -20,9 +20,19 @@ WHAT IT DOES
 READS THE LIVE RANKER. recommend_movies is AST-extracted from $space/app.py, so
 this stays in sync with whatever is deployed (same trick as the eval harnesses).
 
+TWO THINGS TO KNOW BEFORE READING THE OUTPUT
+  * The deployed tabs apply MOVIE_TAB_VOTE_CEILING (8000) and this probe does
+    not, unless you pass --vote-ceiling. Without it, bucket sizes here are
+    larger than what ships and the viability test measures a pool the app does
+    not serve. Pass --vote-ceiling 8000 to match production.
+  * Any change to MOVIE_MIN_RUNTIME changes the candidate set, so numbers from
+    this probe are not comparable across a runtime-floor change. Decide the
+    floor first, then run this once.
+
 USAGE
     python tests/probe_genre_tabs.py tests/movies_ratings.json
     python tests/probe_genre_tabs.py tests/movies_ratings.json --per-tab 10 --pool 400
+    python tests/probe_genre_tabs.py tests/movies_ratings.json --vote-ceiling 8000
 """
 import argparse
 import ast
@@ -38,6 +48,15 @@ import pandas as pd
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SPACE_APP = REPO_ROOT.parent / "hf-space" / "app.py"
 PROCESSED = REPO_ROOT / "data" / "processed"
+
+# TMDB's canonical genre ids. Used to test whether the first genre in a film's
+# list carries information or is just ascending id order.
+TMDB_ID = {"Adventure": 12, "Fantasy": 14, "Animation": 16, "Drama": 18,
+           "Horror": 27, "Action": 28, "Comedy": 35, "History": 36,
+           "Western": 37, "Thriller": 53, "Crime": 80, "Documentary": 99,
+           "Science Fiction": 878, "Mystery": 9648, "Music": 10402,
+           "Romance": 10749, "Family": 10751, "War": 10752, "TV Movie": 10770}
+
 
 # Mirrors _genre_bucket inside recommend_movies. Kept in step with it: Crime and
 # Thriller collapse to one bucket because "Action, Comedy, Crime" would
@@ -101,14 +120,27 @@ def load_ranker():
         "hf_hub_download": None,
     }
     ok = 0
+    failures = {}
     for seg in parts:
         try:
             exec(seg, ns)
             ok += 1
-        except Exception:
-            pass          # UI-bound or dependent on something we do not need
-    if "recommend_movies" not in ns:
-        sys.exit("could not load recommend_movies from app.py")
+        except Exception as e:
+            # UI-bound or dependent on something we do not need. Recorded
+            # rather than swallowed: a missing name here surfaces later as an
+            # opaque KeyError three steps down.
+            head = seg.strip().splitlines()[0][:60]
+            failures[head] = f"{type(e).__name__}: {e}"
+
+    # Both of these are required downstream. Checking only recommend_movies
+    # left IndexVectors to fail as a bare KeyError with no explanation.
+    missing = [n for n in ("recommend_movies", "IndexVectors") if n not in ns]
+    if missing:
+        print(f"\ncould not load {missing} from app.py. Exec failures:")
+        for head, err in list(failures.items())[:15]:
+            print(f"   {head:62s} {err}")
+        sys.exit(1)
+
     print(f"  loaded {ok}/{len(parts)} top-level definitions from app.py")
     return ns
 
@@ -203,6 +235,44 @@ def load_ratings(path, ls_key="re_movies"):
     return items
 
 
+def report_id_order(genre_lists):
+    """THE FALSIFIER — run this before reading anything else.
+
+    Primary-genre bucketing assumes the first genre in a film's list is the
+    most relevant one. If TMDB simply returns genres sorted by id, "first
+    genre" means Adventure(12) always beats Comedy(35) beats Crime(80), and
+    every primary-genre bucket is an artefact of the id numbering rather than
+    a statement about the film.
+    """
+    asc = tot = 0
+    for g in genre_lists:
+        if isinstance(g, list) and len(g) > 1:
+            ids = [TMDB_ID.get(x, 0) for x in g]
+            tot += 1
+            asc += int(ids == sorted(ids))
+    print("=" * 68)
+    print("FALSIFIER: is 'first genre' meaningful, or just TMDB id order?")
+    if not tot:
+        print("  no multi-genre films in the pool — cannot test.")
+        print("=" * 68 + "\n")
+        return None
+    frac = asc / tot
+    print(f"  multi-genre films whose order is ascending by TMDB id: "
+          f"{asc}/{tot} ({frac:.0%})")
+    if frac >= 0.90:
+        print("  >> ~100%: 'first genre' IS id order. Primary-genre bucketing is")
+        print("     arbitrary and the tabs below are labelling an artefact.")
+        print("     STOP AND READ THIS BEFORE THE VERDICT AT THE BOTTOM.")
+    elif frac < 0.60:
+        print("  >> below 60%: the order carries real information.")
+        print("     Primary-genre bucketing is sound.")
+    else:
+        print("  >> ambiguous (60-90%). Partly id order, partly not. Spot-check")
+        print("     the sample titles below before trusting the buckets.")
+    print("=" * 68 + "\n")
+    return frac
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ratings", help="movie ratings JSON (same file eval_loo uses)")
@@ -214,6 +284,10 @@ def main():
                     help="key to read from a localStorage dump")
     ap.add_argument("--distinct-at", type=float, default=0.35,
                     help="max Jaccard vs an already-chosen tab to still count as distinct")
+    ap.add_argument("--vote-ceiling", type=int, default=0,
+                    help="drop candidates at/above this vote_count, matching "
+                         "MOVIE_TAB_VOTE_CEILING in app.py (8000). 0 = off, "
+                         "which measures a LARGER pool than the app serves.")
     args = ap.parse_args()
 
     ratings = load_ratings(Path(args.ratings), args.ls_key)
@@ -231,13 +305,41 @@ def main():
     # --- Deep pool: caps off, flat, so bucketing sees the real ranking --------
     pool, _ = rec(ratings, df, emb, index, tags_df=tags, n=args.pool,
                   flat_ranking=True, genre_cap=10_000, per_anchor_cap=10_000)
-    print(f"deep pool     : {len(pool)} films\n")
+    print(f"deep pool     : {len(pool)} films")
 
     if not len(pool):
         sys.exit("deep pool is empty — the ranker returned nothing for this profile.")
+
+    # --- Deep-cut ceiling: match the deployed tabs ---------------------------
+    # An absolute ceiling, not a per-bucket median. A relative cut removes half
+    # of EVERY bucket including ones already obscure, which is how Action's
+    # best pick fell from Hard Boiled to Stolen. "Already famous" is absolute.
+    if args.vote_ceiling:
+        if "vote_count" not in pool.columns:
+            print("  WARNING: --vote-ceiling requested but the ranker did not "
+                  "return vote_count; ceiling NOT applied.")
+        else:
+            before = len(pool)
+            pool = pool[pool["vote_count"] < args.vote_ceiling].reset_index(drop=True)
+            print(f"vote ceiling  : {before} -> {len(pool)} "
+                  f"(dropped {before - len(pool)} at >= {args.vote_ceiling:,} votes)")
+    else:
+        print("vote ceiling  : OFF — this pool is LARGER than the app's tabs use.")
+        print("                pass --vote-ceiling 8000 to match production.")
+    print()
+
     # _film_row returns genres as a LIST; genre_bucket wants the raw string.
     pool = pool.assign(_bucket=[genre_bucket(", ".join(g) if isinstance(g, list) else (g or ""))
                                 for g in pool["genres"]])
+
+    pool_ex = pool[~pool["id"].isin(overall_ids)].reset_index(drop=True)
+    genre_sets = [set(g) if isinstance(g, list) else set() for g in pool_ex["genres"]]
+
+    # --- FALSIFIER FIRST -----------------------------------------------------
+    # Hoisted above the bucket output on purpose. Reading it last means every
+    # encouraging number has already landed before the one that can invalidate
+    # the whole design.
+    report_id_order(pool_ex["genres"])
 
     counts = pool["_bucket"].value_counts()
     print("SINGLE-ASSIGNMENT buckets (ranker's own rule, one bucket per film):")
@@ -249,8 +351,6 @@ def main():
     # --- MULTI-LABEL: the design question actually being asked ---------------
     # A film carries several genres. If the Crime tab and the Action tab both
     # draw from the full genre list, do they surface the same films?
-    pool_ex = pool[~pool["id"].isin(overall_ids)].reset_index(drop=True)
-    genre_sets = [set(g) if isinstance(g, list) else set() for g in pool_ex["genres"]]
     all_genres = Counter(g for gs in genre_sets for g in gs)
 
     print(f"MULTI-LABEL genre mass in the pool (minus Tab 1, n={len(pool_ex)}):")
@@ -281,7 +381,7 @@ def main():
     # --- PRIMARY-GENRE: one film, one tab, using TMDB's FIRST genre only -----
     # No crime/thriller merge: that merge exists to stop the diversity cap
     # being laundered, which is a different job from labelling a tab.
-    prim = [ (g[0] if isinstance(g, list) and g else "_none") for g in pool_ex["genres"] ]
+    prim = [(g[0] if isinstance(g, list) and g else "_none") for g in pool_ex["genres"]]
     pool_ex = pool_ex.assign(_primary=prim)
     pcounts = pool_ex["_primary"].value_counts()
     print("PRIMARY-GENRE buckets (first genre, no merge, disjoint by design):")
@@ -290,29 +390,12 @@ def main():
         print(f"   {g:22s} {c:4d}  {ok}")
     viable = [g for g, c in pcounts.items() if c >= args.per_tab * 2 and g != "_none"]
     print(f"   -> {len(viable)} bucket(s) with >= {args.per_tab*2} films: {', '.join(viable[:6])}")
+    if not args.vote_ceiling:
+        print("   (measured WITHOUT the vote ceiling — the app's buckets are smaller)")
     print()
     for g in viable[:4]:
         t = pool_ex[pool_ex["_primary"] == g]["title"].head(5).tolist()
         print(f"   {g:14s} {', '.join(x[:22] for x in t)}")
-    print()
-
-    # Is "first genre" meaningful, or just TMDB id order?
-    TMDB_ID = {"Adventure":12,"Fantasy":14,"Animation":16,"Drama":18,"Horror":27,
-               "Action":28,"Comedy":35,"History":36,"Western":37,"Thriller":53,
-               "Crime":80,"Documentary":99,"Science Fiction":878,"Mystery":9648,
-               "Music":10402,"Romance":10749,"Family":10751,"War":10752,"TV Movie":10770}
-    asc = tot = 0
-    for g in pool_ex["genres"]:
-        if isinstance(g, list) and len(g) > 1:
-            ids = [TMDB_ID.get(x, 0) for x in g]
-            tot += 1
-            asc += int(ids == sorted(ids))
-    if tot:
-        print(f"multi-genre films whose genre order is ascending by TMDB id: "
-              f"{asc}/{tot} ({asc/tot:.0%})")
-        print("   ~100% => 'first genre' is id order, NOT relevance: primary-genre")
-        print("           bucketing would be arbitrary.")
-        print("   <60%  => the order carries real information: primary-genre is sound.")
     print()
 
     pairs = [(jaccard(ml_tabs[a], ml_tabs[b]), a, b) for a, b in combinations(names, 2)]
@@ -340,6 +423,7 @@ def main():
     print("If 3-4, they are real. Run it on a friend's profile too — a broad")
     print("taste will support more tabs than a narrow one, and the feature")
     print("should adapt to that rather than always showing four.")
+    print("\nAnd re-read the FALSIFIER block at the top before acting on this.")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,14 @@ description>=100 chars and genre-tag presence both hold near 1.0 to rank 10K,
 roughly 90K usable rows; going deeper spends requests on rows that mostly fail
 the description filter.
 
+WORK_ID
+recommend_books dedups editions on df["work_id"] and raises KeyError if the
+column is absent -- a confirmed live crash that took the books tab down. This
+script did not emit it, so re-running the merge regenerated a parquet without
+it. The merge stage now CARRIES FORWARD work_id from the existing parquet by
+book_id rather than inventing values, because the live column may hold real
+work-level ids that a book_id fallback would silently degrade into a no-op.
+
 STAGES
   harvest : page through books by users_count desc -> raw.jsonl (resumable)
   filter  : apply quality gates -> filtered.jsonl + rejects.jsonl (with reasons)
@@ -318,7 +326,64 @@ def stage_merge(write=False):
 
     df = pd.DataFrame(rows).drop_duplicates(subset="book_id").reset_index(drop=True)
 
-    print(f"merge: {len(df):,} rows")
+    # --- work_id: carry forward, never invent --------------------------------
+    # recommend_books does `book["work_id"]` unguarded. Regenerating this
+    # parquet without the column is a live crash path. The existing parquet is
+    # the only source of truth for what the values mean, so join on book_id and
+    # report how much was recovered instead of defaulting everything to
+    # book_id, which would turn edition dedup into a silent no-op.
+    prior_wid = {}
+    if OUT_PARQUET.exists():
+        try:
+            _prev = pd.read_parquet(OUT_PARQUET, columns=["book_id", "work_id"])
+            prior_wid = dict(zip(_prev["book_id"].astype(str), _prev["work_id"]))
+            print(f"  carried work_id from existing parquet for {len(prior_wid):,} book_ids")
+        except (KeyError, ValueError, OSError) as e:
+            print(f"  existing parquet has no usable work_id ({type(e).__name__}); "
+                  f"falling back to book_id")
+    else:
+        print("  no existing parquet — work_id falls back to book_id")
+
+    df["work_id"] = [prior_wid.get(b, b) for b in df["book_id"]]
+    _fellback = sum(1 for b in df["book_id"] if b not in prior_wid)
+    if _fellback:
+        print(f"  work_id fallback (== book_id) on {_fellback:,} rows "
+              f"({_fellback / max(len(df), 1):.1%})")
+        if prior_wid:
+            print("    these dedup against nothing. Fine for genuinely new books;")
+            print("    a large number here means the join key drifted — check before --write.")
+    _degenerate = (df["work_id"].astype(str) == df["book_id"].astype(str)).mean()
+    if _degenerate > 0.99:
+        print(f"  NOTE: work_id == book_id on {_degenerate:.0%} of rows, so edition")
+        print("        dedup is a no-op. The column exists to stop the KeyError;")
+        print("        real edition grouping needs a work-level key (normalised")
+        print("        title + author) and is a separate, behaviour-changing job.")
+
+    # --- row order vs the live parquet ---------------------------------------
+    # If filtered.jsonl is unchanged, this regenerates the SAME rows in the SAME
+    # order, which means .npy and FAISS stay valid and this becomes a
+    # parquet-only upload with no re-embed. Worth knowing which case you are in
+    # BEFORE uploading, not after.
+    if OUT_PARQUET.exists():
+        try:
+            _prev_ids = pd.read_parquet(OUT_PARQUET, columns=["book_id"])["book_id"].astype(str).tolist()
+            _now_ids = df["book_id"].astype(str).tolist()
+            if _prev_ids == _now_ids:
+                print(f"\n  ROW ORDER IDENTICAL to the live parquet ({len(_now_ids):,} rows).")
+                print("  Embeddings and FAISS stay valid -> PARQUET-ONLY upload, no re-embed.")
+            else:
+                print(f"\n  ROW ORDER CHANGED: live {len(_prev_ids):,} rows, now {len(_now_ids):,}.")
+                print("  Every stored corpus_index is invalidated and a FULL re-embed +")
+                print("  index rebuild is required. Do NOT treat this as a cheap upload.")
+                _common = len(set(_prev_ids) & set(_now_ids))
+                print(f"  ({_common:,} book_ids in common; "
+                      f"{len(set(_now_ids) - set(_prev_ids)):,} new, "
+                      f"{len(set(_prev_ids) - set(_now_ids)):,} dropped)")
+        except (KeyError, ValueError, OSError):
+            pass
+
+    print(f"\nmerge: {len(df):,} rows")
+    print(f"  with work_id     {df['work_id'].notna().mean():.1%}")
     print(f"  with genres      {(df['genres'].str.len() > 0).mean():.1%}")
     print(f"  with moods       {(df['moods'].str.len() > 0).mean():.1%}")
     print(f"  with cover       {(df['image_url'] != '').mean():.1%}")

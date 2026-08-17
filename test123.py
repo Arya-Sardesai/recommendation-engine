@@ -1,6 +1,8 @@
 import pandas as pd
-old = pd.read_parquet(r"data\processed\book_tags.parquet")
-new = pd.read_parquet(r"data\processed\book_tags_knn.parquet")
-print(old.columns.tolist()); print(old.dtypes)
-print(new.columns.tolist()); print(new.dtypes)
-print(len(old), len(new), new.iloc[0].to_dict())
+b = pd.read_parquet("data/processed/books_v2_hc.parquet")
+print(len(b), "rows")
+print(list(b.columns))
+print("work_id present:", "work_id" in b.columns)
+if "work_id" in b.columns:
+    print("work_id == book_id on:", (b["work_id"].astype(str) == b["book_id"].astype(str)).mean())
+    print(b[["book_id","work_id","title"]].head())
