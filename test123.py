@@ -1,8 +1,5 @@
 import pandas as pd
 b = pd.read_parquet("data/processed/books_v2_hc.parquet")
-print(len(b), "rows")
-print(list(b.columns))
-print("work_id present:", "work_id" in b.columns)
-if "work_id" in b.columns:
-    print("work_id == book_id on:", (b["work_id"].astype(str) == b["book_id"].astype(str)).mean())
-    print(b[["book_id","work_id","title"]].head())
+bad = b["primary_author"].str.contains("©|Ã|â€|Â", regex=True, na=False)
+print(bad.sum(), "authors with mojibake")
+print(b.loc[bad, "primary_author"].value_counts().head(15))

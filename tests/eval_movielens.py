@@ -59,10 +59,15 @@ import numpy as np
 import pandas as pd
 import faiss
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ranker_loader import load_ranker, resolve_artifacts  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # CONFIG — artifact paths (same layout as eval_loo.py; run from repo root)
 # ---------------------------------------------------------------------------
 PROCESSED = Path("data/processed")
+# Resolved from app.py at runtime by resolve_artifacts() -- see main().
+# These remain only as the fallback if a constant is missing from app.py.
 CORPUS_PATH = PROCESSED / "movies.parquet"
 EMB_PATH = PROCESSED / "movie_embeddings_bgem3_v2_kw2.npy"
 FAISS_PATH = PROCESSED / "movie_faiss_bgem3_v2_kw2.index"
@@ -87,23 +92,13 @@ TUNE_GRID = [
 ]
 
 
+# The hand-maintained whitelist that used to live here broke every time a new
+# module-level constant appeared in app.py (MOVIE_MIN_RUNTIME and
+# MOVIE_KIDS_FILTER as defaulted parameters killed both harnesses at once with
+# a NameError). ranker_loader takes every top-level definition instead, so it
+# tracks app.py without edits here.
 def load_app_functions(app_path):
-    src = open(app_path).read()
-    tree = ast.parse(src)
-    wanted_assign = {"LANG_NAMES", "_TITLE_STOPWORDS"}
-    wanted_funcs = {"lang_label", "_title_tokens", "_is_title_dup", "recommend_movies"}
-    ns = {"np": np, "pd": pd, "faiss": faiss}
-    for node in tree.body:
-        take = False
-        if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
-            take = True
-        if isinstance(node, ast.Assign):
-            for t in node.targets:
-                if isinstance(t, ast.Name) and t.id in wanted_assign:
-                    take = True
-        if take:
-            exec(compile(ast.Module(body=[node], type_ignores=[]), str(app_path), "exec"), ns)
-    return ns["recommend_movies"]
+    return load_ranker(app_path)["recommend_movies"]
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +309,115 @@ ABLATIONS = [
 ]
 
 
+# The v1 enrichment changes, isolated. Every row runs on the SAME users with
+# the SAME seeded splits, so the deltas are directly attributable.
+#
+# Both of these REMOVE candidates, so leave-out recall can only fall or hold --
+# the question is by how much, and whether the answer is small enough that
+# "adult profiles stop getting children's films" is worth paying for. Shipping
+# a filter without measuring what it costs is how a quality fix quietly becomes
+# a quality regression.
+ENRICHMENT_CONFIGS = [
+    ("shipped (rt20 + kids)",  None),
+    ("kids filter OFF",        {"kids_filter": False}),
+    ("runtime floor OFF",      {"min_runtime": 0}),
+    ("old floor (rt40)",       {"min_runtime": 40}),
+    ("both OFF (pre-v1)",      {"min_runtime": 0, "kids_filter": False}),
+]
+
+
+def enrichment_cost(users, df, embeddings, index, tags_df, recommend_movies):
+    if "cert_tier" not in df.columns:
+        print("\nWARNING: the loaded corpus has no cert_tier column, so the kids")
+        print("filter is inert and the 'kids filter OFF' row will be identical")
+        print("to 'shipped'. Point M_CORPUS at the enriched parquet first.\n")
+
+    print(f"\nENRICHMENT COST on {len(users)} users — same users, same seeded")
+    print("splits, so rows are directly comparable.\n")
+    rows = []
+    for name, params in ENRICHMENT_CONFIGS:
+        s, n = eval_users(users, df, embeddings, index, tags_df,
+                          recommend_movies, params=params, methods=("new",),
+                          label=f"{name}: ")
+        rows.append((name, s["new"]))
+
+    base = dict(rows)["shipped (rt20 + kids)"]
+    print("\n" + "=" * 82)
+    print(f"{'config':<26}{'recall@10':>12}{'recall@20':>12}{'recall@50':>12}"
+          f"{'hit@20':>10}{'d r@20':>10}")
+    print("-" * 82)
+    for name, r in rows:
+        d = r["r20"][0] - base["r20"][0]
+        dtxt = "  (base)" if name.startswith("shipped") else f"{d:+.4f}"
+        print(f"{name:<26}{r['r10'][0]:>12.4f}{r['r20'][0]:>12.4f}"
+              f"{r['r50'][0]:>12.4f}{r['hit20'][0]:>10.3f}{dtxt:>10}")
+    print("=" * 82)
+
+    by = dict(rows)
+    kid_cost = by["kids filter OFF"]["r20"][0] - base["r20"][0]
+    rt_cost = by["runtime floor OFF"]["r20"][0] - base["r20"][0]
+    se = base["r20"][1]
+    print(f"stderr on the base recall@20 is ±{se:.4f}; treat gaps under ~{2*se:.4f}")
+    print("as noise rather than a measured cost.\n")
+    print(f"  kids filter  costs {kid_cost:+.4f} recall@20 "
+          f"({'within noise' if abs(kid_cost) < 2*se else 'REAL'})")
+    print(f"  runtime floor costs {rt_cost:+.4f} recall@20 "
+          f"({'within noise' if abs(rt_cost) < 2*se else 'REAL'})")
+    print("\nMovieLens users are adults rating adult films, so the kids filter")
+    print("should cost close to nothing here. If it costs a lot, the")
+    print("suppression set is catching films it should not -- check which")
+    print("titles with probe_kids_filter before accepting the number.")
+
+
+# Popularity prior sweep. A plain popularity ranking beats this ranker at every
+# k, so blending some of it back should raise recall -- the question is how much
+# is bought at what weight, and where the recs stop being recommendations and
+# start being a top-films list.
+#
+# Applies to the main "For you" ranking only; the genre tabs cut at
+# MOVIE_TAB_VOTE_CEILING and are meant to stay deep.
+POP_WEIGHTS = [0.0, 0.05, 0.10, 0.20, 0.35, 0.50]
+
+
+def pop_sweep(users, df, embeddings, index, tags_df, recommend_movies):
+    print(f"\nPOPULARITY PRIOR SWEEP on {len(users)} users — same users, same")
+    print("seeded splits. pop_weight=0.0 is the shipped ranker.\n")
+    rows = []
+    for w in POP_WEIGHTS:
+        s, n = eval_users(users, df, embeddings, index, tags_df,
+                          recommend_movies, params={"pop_weight": w},
+                          methods=("new",), label=f"w={w}: ")
+        rows.append((w, s["new"]))
+    s_pop, _ = eval_users(users, df, embeddings, index, tags_df,
+                          recommend_movies, methods=("pop",), label="pop: ")
+
+    base = rows[0][1]
+    print("\n" + "=" * 78)
+    print(f"{'pop_weight':<14}{'recall@10':>12}{'recall@20':>12}{'recall@50':>12}"
+          f"{'hit@20':>10}{'d r@20':>12}")
+    print("-" * 78)
+    for w, r in rows:
+        d = r["r20"][0] - base["r20"][0]
+        dtxt = "  (base)" if w == 0.0 else f"{d:+.4f}"
+        print(f"{w:<14.2f}{r['r10'][0]:>12.4f}{r['r20'][0]:>12.4f}"
+              f"{r['r50'][0]:>12.4f}{r['hit20'][0]:>10.3f}{dtxt:>12}")
+    rp = s_pop["pop"]
+    print(f"{'pure popularity':<14}{rp['r10'][0]:>12.4f}{rp['r20'][0]:>12.4f}"
+          f"{rp['r50'][0]:>12.4f}{rp['hit20'][0]:>10.3f}")
+    print("=" * 78)
+
+    best = max(rows, key=lambda x: x[1]["r20"][0])
+    gap = rp["r20"][0] - base["r20"][0]
+    recovered = (best[1]["r20"][0] - base["r20"][0]) / gap if gap else 0.0
+    print(f"best weight {best[0]:.2f}: recall@20 {best[1]['r20'][0]:.4f}")
+    print(f"closes {recovered:.0%} of the gap to pure popularity.")
+    print("\nTHE NUMBER IS NOT THE DECISION. A higher weight always scores better")
+    print("here because the metric rewards guessing films the user already found.")
+    print("Check the actual output at the chosen weight before shipping it: if")
+    print("the top 20 turn into films anyone could have named, the recall gain")
+    print("bought nothing a user wanted.")
+
+
 def ablate(users, df, embeddings, index, tags_df, recommend_movies):
     print(f"\nABLATION on {len(users)} users — one component off per row; same "
           f"users, same splits (seeded), so rows are directly comparable.\n")
@@ -349,23 +453,48 @@ def main():
     ap.add_argument("--test-users", type=int, default=150, help="tuning mode: unseen validation users")
     ap.add_argument("--tune", action="store_true")
     ap.add_argument("--ablate", action="store_true")
+    ap.add_argument("--pop-sweep", action="store_true",
+                    help="sweep the popularity prior weight")
+    ap.add_argument("--enrichment-cost", action="store_true",
+                    help="measure what the runtime floor and kids filter cost "
+                         "in recall, against the same users")
     ap.add_argument("--seed", type=int, default=SEED)
     args = ap.parse_args()
 
     recommend_movies = load_app_functions(APP_PY)
     print("loading corpus + artifacts...")
-    df = pd.read_parquet(CORPUS_PATH).reset_index(drop=True)
-    embeddings = np.load(EMB_PATH).astype("float32")
-    index = faiss.read_index(str(FAISS_PATH))
+
+    # Follow app.py rather than the constants at the top of this file. A
+    # hardcoded movies.parquet meant this harness evaluated the
+    # pre-enrichment corpus -- no cert_tier, kids filter inert -- while
+    # printing numbers that looked entirely normal.
+    art = resolve_artifacts(APP_PY, PROCESSED, kind="movie")
+    corpus_path = art.get("CORPUS", CORPUS_PATH)
+    emb_path = art.get("EMB", EMB_PATH)
+    faiss_path = art.get("FAISS", FAISS_PATH)
+    tags_path = art.get("TAGS", TAGS_PATH)
+
+    df = pd.read_parquet(corpus_path).reset_index(drop=True)
+    embeddings = np.load(emb_path).astype("float32")
+    index = faiss.read_index(str(faiss_path))
+    assert len(df) == embeddings.shape[0] == index.ntotal, (
+        f"ALIGNMENT: parquet {len(df)}, npy {embeddings.shape[0]}, "
+        f"index {index.ntotal}")
+    print(f"  corpus {len(df):,} rows, aligned"
+          f"{'  [cert_tier present]' if 'cert_tier' in df.columns else ''}")
     tags_df = None
-    if TAGS_PATH.exists():
-        t = pd.read_parquet(TAGS_PATH)
+    if Path(tags_path).exists():
+        t = pd.read_parquet(tags_path)
         t["movie_id"] = t["movie_id"].astype(str)
         tags_df = t.pivot_table(index="movie_id", columns="tag", values="score", fill_value=0.0)
         print(f"tags loaded: {tags_df.shape[0]:,} films")
 
     users, chosen = load_movielens(args.ml_dir, df, args.users, args.seed)
-    if args.ablate:
+    if args.pop_sweep:
+        pop_sweep(users, df, embeddings, index, tags_df, recommend_movies)
+    elif args.enrichment_cost:
+        enrichment_cost(users, df, embeddings, index, tags_df, recommend_movies)
+    elif args.ablate:
         ablate(users, df, embeddings, index, tags_df, recommend_movies)
     elif args.tune:
         users_test, _ = load_movielens(args.ml_dir, df, args.test_users,

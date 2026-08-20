@@ -47,10 +47,15 @@ import numpy as np
 import pandas as pd
 import faiss
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ranker_loader import load_ranker, resolve_artifacts  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # CONFIG — point these at your local artifacts
 # ---------------------------------------------------------------------------
 PROCESSED = Path("data/processed")
+# Resolved from app.py at runtime by resolve_artifacts() -- see main().
+# These remain only as the fallback if a constant is missing from app.py.
 CORPUS_PATH = PROCESSED / "movies.parquet"
 EMB_PATH = PROCESSED / "movie_embeddings_bgem3_v2_kw2.npy"
 FAISS_PATH = PROCESSED / "movie_faiss_bgem3_v2_kw2.index"
@@ -65,23 +70,13 @@ MIN_VOTES = 400      # same floor as the app
 # ---------------------------------------------------------------------------
 # Pull the ranker + helpers out of app.py (same AST pattern as the smoke tests)
 # ---------------------------------------------------------------------------
+# The hand-maintained whitelist that used to live here broke every time a new
+# module-level constant appeared in app.py (MOVIE_MIN_RUNTIME and
+# MOVIE_KIDS_FILTER as defaulted parameters killed both harnesses at once with
+# a NameError). ranker_loader takes every top-level definition instead, so it
+# tracks app.py without edits here.
 def load_app_functions(app_path):
-    src = open(app_path).read()
-    tree = ast.parse(src)
-    wanted_assign = {"LANG_NAMES", "_TITLE_STOPWORDS"}
-    wanted_funcs = {"lang_label", "_title_tokens", "_is_title_dup", "recommend_movies"}
-    ns = {"np": np, "pd": pd, "faiss": faiss}
-    for node in tree.body:
-        take = False
-        if isinstance(node, ast.FunctionDef) and node.name in wanted_funcs:
-            take = True
-        if isinstance(node, ast.Assign):
-            for t in node.targets:
-                if isinstance(t, ast.Name) and t.id in wanted_assign:
-                    take = True
-        if take:
-            exec(compile(ast.Module(body=[node], type_ignores=[]), str(app_path), "exec"), ns)
-    return ns["recommend_movies"]
+    return load_ranker(app_path)["recommend_movies"]
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +183,28 @@ def main():
     print(f"loaded {len(ratings_raw)} ratings from {sys.argv[1]}")
 
     recommend_movies = load_app_functions(APP_PY)
-    df = pd.read_parquet(CORPUS_PATH).reset_index(drop=True)
-    embeddings = np.load(EMB_PATH).astype("float32")
-    index = faiss.read_index(str(FAISS_PATH))
+
+    # Follow app.py rather than the constants above. Hardcoding movies.parquet
+    # meant this harness evaluated the PRE-ENRICHMENT corpus: no cert_tier, so
+    # the kids-content filter was inert and the numbers described a ranker that
+    # was never deployed.
+    art = resolve_artifacts(APP_PY, PROCESSED, kind="movie")
+    corpus_path = art.get("CORPUS", CORPUS_PATH)
+    emb_path = art.get("EMB", EMB_PATH)
+    faiss_path = art.get("FAISS", FAISS_PATH)
+    tags_path = art.get("TAGS", TAGS_PATH)
+
+    df = pd.read_parquet(corpus_path).reset_index(drop=True)
+    embeddings = np.load(emb_path).astype("float32")
+    index = faiss.read_index(str(faiss_path))
+    assert len(df) == embeddings.shape[0] == index.ntotal, (
+        f"ALIGNMENT: parquet {len(df)}, npy {embeddings.shape[0]}, "
+        f"index {index.ntotal}")
+    print(f"  corpus {len(df):,} rows, aligned"
+          f"{'  [cert_tier present]' if 'cert_tier' in df.columns else ''}")
     tags_df = None
-    if TAGS_PATH.exists():
-        t = pd.read_parquet(TAGS_PATH)
+    if Path(tags_path).exists():
+        t = pd.read_parquet(tags_path)
         t["movie_id"] = t["movie_id"].astype(str)
         tags_df = t.pivot_table(index="movie_id", columns="tag", values="score", fill_value=0.0)
         print(f"tags loaded: {tags_df.shape[0]:,} films")
