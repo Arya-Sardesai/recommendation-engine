@@ -49,8 +49,31 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SPACE_APP = REPO_ROOT.parent / "hf-space" / "app.py"
 PROCESSED = REPO_ROOT / "data" / "processed"
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from ranker_loader import load_ranker as _load_ranker  # noqa: E402
+from ranker_loader import resolve_artifacts as _resolve  # noqa: E402
+
+# Per-modality column names and ranker entry points. The three corpora use
+# different id/title columns, which is the only thing that differs here.
+KINDS = {
+    "movie": {"ranker": "recommend_movies", "id": "id", "title": "title",
+              "prefix": "M_", "label": "films"},
+    "tv":    {"ranker": "recommend_tv", "id": "tmdb_id", "title": "name",
+              "prefix": "T_", "label": "series"},
+}
+
 # TMDB's canonical genre ids. Used to test whether the first genre in a film's
 # list carries information or is just ascending id order.
+# TMDB uses a SEPARATE genre vocabulary for TV: merged buckets
+# ("Action & Adventure", "Sci-Fi & Fantasy") and ids that do not overlap the
+# film list. Testing TV genre order against film ids would silently score 0%
+# ascending and wrongly declare the order meaningful.
+TMDB_ID_TV = {"Action & Adventure": 10759, "Animation": 16, "Comedy": 35,
+              "Crime": 80, "Documentary": 99, "Drama": 18, "Family": 10751,
+              "Kids": 10762, "Mystery": 9648, "News": 10763, "Reality": 10764,
+              "Sci-Fi & Fantasy": 10765, "Soap": 10766, "Talk": 10767,
+              "War & Politics": 10768, "Western": 37}
+
 TMDB_ID = {"Adventure": 12, "Fantasy": 14, "Animation": 16, "Drama": 18,
            "Horror": 27, "Action": 28, "Comedy": 35, "History": 36,
            "Western": 37, "Thriller": 53, "Crime": 80, "Documentary": 99,
@@ -61,6 +84,22 @@ TMDB_ID = {"Adventure": 12, "Fantasy": 14, "Animation": 16, "Drama": 18,
 # Mirrors _genre_bucket inside recommend_movies. Kept in step with it: Crime and
 # Thriller collapse to one bucket because "Action, Comedy, Crime" would
 # otherwise launder past a first-genre cap.
+def genre_list(g):
+    """Normalise a genres cell to a list.
+
+    _film_row returns a LIST for movies; the TV row builder passes the raw
+    comma-separated STRING straight through. The multi-label section used to
+    test isinstance(list) only, so every TV show read as having zero genres
+    and the probe reported "not enough multi-label buckets" on a corpus where
+    most shows carry two or three.
+    """
+    if isinstance(g, (list, tuple, set)):
+        return [str(x).strip() for x in g if str(x).strip()]
+    if isinstance(g, str):
+        return [x.strip() for x in g.split(",") if x.strip()]
+    return []
+
+
 def genre_bucket(genres_str):
     gs = genres_str if isinstance(genres_str, str) else ""
     gset = {g.strip() for g in gs.split(",") if g.strip()}
@@ -87,92 +126,37 @@ class _StubST:
         return lambda *a, **k: None
 
 
-def load_ranker():
-    """Exec every top-level def/const from the deployed app.py.
-
-    Whitelisting individual functions was brittle: recommend_movies calls
-    module-level helpers (_title_tokens, lang_label, ...) and adding a new one
-    would silently break this probe with a NameError. Taking all top-level
-    FunctionDef / ClassDef / Assign nodes tracks app.py automatically; UI code
-    at module level is skipped because it is not a definition.
-    """
-    if not SPACE_APP.exists():
-        sys.exit(f"{SPACE_APP} not found — point SPACE_APP at your hf-space app.py")
-    src = SPACE_APP.read_text(encoding="utf-8")
-    tree = ast.parse(src)
-
-    parts = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign)):
-            seg = ast.get_source_segment(src, node)
-            if seg:
-                parts.append(seg)
-
-    import collections
-    import difflib
-    import re as _re
-    import unicodedata as _ud
-    ns = {
-        "np": np, "pd": pd, "faiss": __import__("faiss"), "st": _StubST(),
-        "json": json, "re": _re, "unicodedata": _ud, "Path": Path, "sys": sys,
-        "SequenceMatcher": difflib.SequenceMatcher,
-        "Counter": collections.Counter, "defaultdict": collections.defaultdict,
-        "hf_hub_download": None,
-    }
-    ok = 0
-    failures = {}
-    for seg in parts:
-        try:
-            exec(seg, ns)
-            ok += 1
-        except Exception as e:
-            # UI-bound or dependent on something we do not need. Recorded
-            # rather than swallowed: a missing name here surfaces later as an
-            # opaque KeyError three steps down.
-            head = seg.strip().splitlines()[0][:60]
-            failures[head] = f"{type(e).__name__}: {e}"
-
-    # Both of these are required downstream. Checking only recommend_movies
-    # left IndexVectors to fail as a bare KeyError with no explanation.
-    missing = [n for n in ("recommend_movies", "IndexVectors") if n not in ns]
-    if missing:
-        print(f"\ncould not load {missing} from app.py. Exec failures:")
-        for head, err in list(failures.items())[:15]:
-            print(f"   {head:62s} {err}")
-        sys.exit(1)
-
-    print(f"  loaded {ok}/{len(parts)} top-level definitions from app.py")
-    return ns
+def load_ranker(kind="movie"):
+    """Thin wrapper over ranker_loader so all four harnesses share one loader."""
+    need = (KINDS[kind]["ranker"], "IndexVectors")
+    return _load_ranker(SPACE_APP, require=need)
 
 
-def load_artifacts(ns):
+def load_artifacts(ns, kind="movie"):
     """Local data/processed first; fall back to the HF dataset repo."""
-    src = SPACE_APP.read_text(encoding="utf-8")
-    consts = {}
-    for line in src.splitlines():
-        line = line.strip()
-        for key in ("M_CORPUS", "M_FAISS", "M_TAGS"):
-            if line.startswith(f"{key} =") and '"' in line:
-                consts[key] = line.split('"')[1]
-    print("using artifacts:", consts)
+    art = _resolve(SPACE_APP, PROCESSED, kind=kind)
 
-    def path_for(fname):
-        local = PROCESSED / fname
-        if local.exists():
-            return str(local)
+    def path_for(p):
+        if p.exists():
+            return str(p)
         from huggingface_hub import hf_hub_download
         return hf_hub_download(repo_id="Arya2305/recommendation-engine-data",
-                               filename=fname, repo_type="dataset")
+                               filename=p.name, repo_type="dataset")
 
     import faiss
-    df = pd.read_parquet(path_for(consts["M_CORPUS"])).reset_index(drop=True)
-    index = faiss.read_index(path_for(consts["M_FAISS"]))
+    df = pd.read_parquet(path_for(art["CORPUS"])).reset_index(drop=True)
+    index = faiss.read_index(path_for(art["FAISS"]))
     tags = None
-    try:
-        t = pd.read_parquet(path_for(consts["M_TAGS"]))
-        tags = t.pivot_table(index="movie_id", columns="tag", values="score", fill_value=0.0)
-    except Exception as e:
-        print(f"  (no tags: {e})")
+    if "TAGS" in art:
+        try:
+            t = pd.read_parquet(path_for(art["TAGS"]))
+            key = "movie_id" if kind == "movie" else "tv_id"
+            if key not in t.columns:
+                key = t.columns[0]
+            tags = t.pivot_table(index=key, columns="tag", values="score",
+                                 fill_value=0.0)
+        except Exception as e:
+            print(f"  (no tags: {e})")
     assert len(df) == index.ntotal, f"ALIGNMENT: {len(df)} rows vs {index.ntotal} index"
     print(f"  corpus {len(df):,}  index {index.ntotal:,}  aligned")
     return df, index, ns["IndexVectors"](index), tags
@@ -183,7 +167,7 @@ def jaccard(a, b):
     return len(a & b) / max(len(a | b), 1)
 
 
-def load_ratings(path, ls_key="re_movies"):
+def load_ratings(path, ls_key="re_movies", kind="movie"):
     """Accept a plain ratings list OR a raw localStorage dump.
 
     The app persists through streamlit-local-storage, so an exported dump is
@@ -199,7 +183,10 @@ def load_ratings(path, ls_key="re_movies"):
         items = raw
     elif isinstance(raw, dict):
         # localStorage dump: prefer the movie-ratings key
-        for key in (ls_key, "ratings", "movie_ratings", "movies", "items", "data"):
+        _alts = ((ls_key, "ratings", "tv_ratings", "tv", "shows", "items", "data")
+                 if kind == "tv" else
+                 (ls_key, "ratings", "movie_ratings", "movies", "items", "data"))
+        for key in _alts:
             v = raw.get(key)
             if isinstance(v, str):
                 try:
@@ -226,7 +213,8 @@ def load_ratings(path, ls_key="re_movies"):
                  f"Keys present: {keys}\n"
                  f"Pass --ls-key to name the right one.")
 
-    need = {"rating", "corpus_index", "movie_id"}
+    need = ({"rating", "corpus_index", "tv_id"} if kind == "tv"
+            else {"rating", "corpus_index", "movie_id"})
     missing = need - set(items[0])
     if missing:
         sys.exit(f"ratings entries are missing {sorted(missing)}.\n"
@@ -235,7 +223,7 @@ def load_ratings(path, ls_key="re_movies"):
     return items
 
 
-def report_id_order(genre_lists):
+def report_id_order(genre_lists, id_map=None):
     """THE FALSIFIER — run this before reading anything else.
 
     Primary-genre bucketing assumes the first genre in a film's list is the
@@ -244,10 +232,12 @@ def report_id_order(genre_lists):
     every primary-genre bucket is an artefact of the id numbering rather than
     a statement about the film.
     """
+    id_map = id_map or TMDB_ID
     asc = tot = 0
     for g in genre_lists:
-        if isinstance(g, list) and len(g) > 1:
-            ids = [TMDB_ID.get(x, 0) for x in g]
+        gl = genre_list(g)
+        if len(gl) > 1:
+            ids = [id_map.get(x, 0) for x in gl]
             tot += 1
             asc += int(ids == sorted(ids))
     print("=" * 68)
@@ -275,7 +265,9 @@ def report_id_order(genre_lists):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("ratings", help="movie ratings JSON (same file eval_loo uses)")
+    ap.add_argument("ratings", help="ratings JSON (same file eval_loo uses)")
+    ap.add_argument("--kind", choices=["movie", "tv"], default="movie",
+                    help="which tab to probe")
     ap.add_argument("--per-tab", type=int, default=10)
     ap.add_argument("--overall", type=int, default=20)
     ap.add_argument("--pool", type=int, default=400, help="deep candidate pool size")
@@ -290,16 +282,37 @@ def main():
                          "which measures a LARGER pool than the app serves.")
     args = ap.parse_args()
 
-    ratings = load_ratings(Path(args.ratings), args.ls_key)
-    print(f"profile: {len(ratings)} rated films\n")
+    K = KINDS[args.kind]
+    ID, TITLE = K["id"], K["title"]
+    if args.kind == "tv" and args.ls_key == "re_movies":
+        args.ls_key = "re_tv"
 
-    ns = load_ranker()
-    df, index, emb, tags = load_artifacts(ns)
-    rec = ns["recommend_movies"]
+    ratings = load_ratings(Path(args.ratings), args.ls_key, kind=args.kind)
+    print(f"profile: {len(ratings)} rated {K['label']}\n")
+
+    ns = load_ranker(args.kind)
+    df, index, emb, tags = load_artifacts(ns, args.kind)
+    rec = ns[K["ranker"]]
+
+    # TV has a far smaller servable pool than movies: min_votes=300 leaves
+    # ~1,750 of 30,235 series. A 400-candidate pool is a quarter of everything
+    # that can surface, so bucket sizes here are near the ceiling of what
+    # exists rather than a sample of a deep corpus. Say so before the numbers
+    # get read as if they were comparable to the movie probe.
+    if "vote_count" in df.columns:
+        floor = 300 if args.kind == "tv" else 400
+        servable = int((df["vote_count"] >= floor).sum())
+        print(f"  servable corpus (votes >= {floor}): {servable:,} of {len(df):,}"
+              f"  ({servable/len(df):.1%})")
+        if servable < args.pool * 5:
+            print(f"  NOTE: pool of {args.pool} is {args.pool/servable:.0%} of the")
+            print("  servable corpus. Tabs drawn from this are not deep cuts —")
+            print("  they are most of what exists.")
+    print()
 
     # --- Tab 1: exactly what the app shows today -----------------------------
     overall, _ = rec(ratings, df, emb, index, tags_df=tags, n=args.overall)
-    overall_ids = set(overall["id"])
+    overall_ids = set(overall[ID])
     print(f"Tab 1 (overall): {len(overall)} films")
 
     # --- Deep pool: caps off, flat, so bucketing sees the real ranking --------
@@ -332,14 +345,15 @@ def main():
     pool = pool.assign(_bucket=[genre_bucket(", ".join(g) if isinstance(g, list) else (g or ""))
                                 for g in pool["genres"]])
 
-    pool_ex = pool[~pool["id"].isin(overall_ids)].reset_index(drop=True)
-    genre_sets = [set(g) if isinstance(g, list) else set() for g in pool_ex["genres"]]
+    pool_ex = pool[~pool[ID].isin(overall_ids)].reset_index(drop=True)
+    genre_sets = [set(genre_list(g)) for g in pool_ex["genres"]]
 
     # --- FALSIFIER FIRST -----------------------------------------------------
     # Hoisted above the bucket output on purpose. Reading it last means every
     # encouraging number has already landed before the one that can invalidate
     # the whole design.
-    report_id_order(pool_ex["genres"])
+    report_id_order(pool_ex["genres"],
+                    TMDB_ID_TV if args.kind == "tv" else TMDB_ID)
 
     counts = pool["_bucket"].value_counts()
     print("SINGLE-ASSIGNMENT buckets (ranker's own rule, one bucket per film):")
@@ -363,7 +377,7 @@ def main():
         if c < args.per_tab:
             continue
         mask = [g in gs for gs in genre_sets]
-        ml_tabs[g] = list(pool_ex[mask]["id"].head(args.per_tab))
+        ml_tabs[g] = list(pool_ex[mask][ID].head(args.per_tab))
 
     if len(ml_tabs) < 2:
         print("not enough multi-label buckets to compare.")
@@ -381,7 +395,7 @@ def main():
     # --- PRIMARY-GENRE: one film, one tab, using TMDB's FIRST genre only -----
     # No crime/thriller merge: that merge exists to stop the diversity cap
     # being laundered, which is a different job from labelling a tab.
-    prim = [(g[0] if isinstance(g, list) and g else "_none") for g in pool_ex["genres"]]
+    prim = [(genre_list(g)[0] if genre_list(g) else "_none") for g in pool_ex["genres"]]
     pool_ex = pool_ex.assign(_primary=prim)
     pcounts = pool_ex["_primary"].value_counts()
     print("PRIMARY-GENRE buckets (first genre, no merge, disjoint by design):")
@@ -394,7 +408,7 @@ def main():
         print("   (measured WITHOUT the vote ceiling — the app's buckets are smaller)")
     print()
     for g in viable[:4]:
-        t = pool_ex[pool_ex["_primary"] == g]["title"].head(5).tolist()
+        t = pool_ex[pool_ex["_primary"] == g][TITLE].head(5).tolist()
         print(f"   {g:14s} {', '.join(x[:22] for x in t)}")
     print()
 
@@ -413,7 +427,7 @@ def main():
             break
     print(f"\nVERDICT: {len(chosen)} distinct multi-label tab(s) at Jaccard <= {args.distinct_at}")
     for g in chosen:
-        titles = pool_ex[pool_ex["id"].isin(ml_tabs[g])]["title"].head(4).tolist()
+        titles = pool_ex[pool_ex[ID].isin(ml_tabs[g])][TITLE].head(4).tolist()
         print(f"   {g:20s} e.g. {', '.join(t[:24] for t in titles)}")
     rejected = [g for g in names[:args.max_tabs + 2] if g not in chosen]
     if rejected:
