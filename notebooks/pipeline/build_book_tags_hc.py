@@ -48,9 +48,25 @@ import pandas as pd
 
 RAW_DIR = Path("data/raw/books/hardcover_v2")
 FILTERED_PATH = RAW_DIR / "filtered.jsonl"
+
+# Tags come from the HARVEST jsonl, not the parquet -- the parquet has no
+# cached_tags column. Books appended by the targeted and rescue paths are
+# absent from filtered.jsonl, so reading only that file silently left them
+# untagged: the build reported "read 74,054 filtered rows" against a
+# 74,074-row corpus and printed coverage as if nothing were missing.
+#
+# Those books sit below app.py's serving floor so they are never RECOMMENDED,
+# but they ARE ratable as anchors, and an anchor's tags feed the user's tag
+# profile. An untagged anchor contributes nothing there.
+TAG_SOURCES = [
+    FILTERED_PATH,
+    RAW_DIR / "targeted_raw.jsonl",
+    RAW_DIR / "rescued_raw.jsonl",
+]
+
 PROCESSED = Path("data/processed")
-CORPUS = PROCESSED / "books_v2_hc.parquet"
-OUT = PROCESSED / "book_tags_v2_hc.parquet"
+CORPUS = PROCESSED / "books_v2_hc2.parquet"
+OUT = PROCESSED / "book_tags_v2_hc2.parquet"
 
 USE_CATEGORIES = ("Genre", "Mood")   # not "Tag" (noisy) or "Content Warning"
 MIN_COUNT = 1            # a tag one person applied is not evidence
@@ -95,8 +111,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="report, write nothing")
     args = ap.parse_args()
 
-    if not FILTERED_PATH.exists():
-        raise SystemExit(f"{FILTERED_PATH} not found -- run fetch_hardcover_v2.py --stage filter")
+    if not any(p.exists() for p in TAG_SOURCES):
+        raise SystemExit(f"no tag source found -- run fetch_hardcover_v2.py --stage filter")
     if not CORPUS.exists():
         raise SystemExit(f"{CORPUS} not found -- run fetch_hardcover_v2.py --stage merge --write")
 
@@ -107,29 +123,45 @@ def main():
     per_book = defaultdict(dict)
     doc_freq = Counter()
     n_rows = 0
-    with open(FILTERED_PATH, encoding="utf-8") as fh:
-        for line in fh:
-            b = json.loads(line)
-            bid = str(b.get("id"))
-            if bid not in corpus_ids:
-                continue
-            n_rows += 1
-            ct = b.get("cached_tags")
-            seen_here = set()
-            for cat in USE_CATEGORIES:
-                for name, count in _tag_list(ct, cat):
-                    t = norm_tag(name)
-                    if not t or t in STOP_TAGS or count < MIN_COUNT:
-                        continue
-                    # keep the larger count if a tag appears in two categories
-                    if count > per_book[bid].get(t, 0):
-                        per_book[bid][t] = count
-                    seen_here.add(t)
-            for t in seen_here:
-                doc_freq[t] += 1
+    for src in TAG_SOURCES:
+        if not src.exists():
+            print(f"  ({src.name} absent, skipping)")
+            continue
+        before = n_rows
+        with open(src, encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip():
+                    continue
+                b = json.loads(line)
+                bid = str(b.get("id"))
+                if bid not in corpus_ids:
+                    continue
+                n_rows += 1
+                ct = b.get("cached_tags")
+                seen_here = set()
+                for cat in USE_CATEGORIES:
+                    for name, count in _tag_list(ct, cat):
+                        t = norm_tag(name)
+                        if not t or t in STOP_TAGS or count < MIN_COUNT:
+                            continue
+                        # keep the larger count if a tag appears in two categories
+                        if count > per_book[bid].get(t, 0):
+                            per_book[bid][t] = count
+                        seen_here.add(t)
+                for t in seen_here:
+                    doc_freq[t] += 1
+        print(f"  {src.name:24s} {n_rows - before:>7,} rows in corpus")
 
-    print(f"read {n_rows:,} filtered rows; {len(per_book):,} have >=1 usable tag "
+    print(f"read {n_rows:,} harvest rows; {len(per_book):,} have >=1 usable tag "
           f"({len(per_book) / max(len(corpus_ids), 1):.1%} coverage)")
+
+    # This mismatch is how the 20 appended books went untagged in silence.
+    # A tag build that reads fewer rows than the corpus has is missing a source.
+    missing = len(corpus_ids) - n_rows
+    if missing > 0:
+        print(f"  WARNING: {missing:,} corpus books have NO tag source at all.")
+        print(f"  Every book in the parquet should appear in one of TAG_SOURCES;")
+        print(f"  if a new harvest path was added, add its jsonl to that list.")
     print(f"vocabulary before frequency pruning: {len(doc_freq):,} tags")
 
     # pass 2: prune the vocabulary

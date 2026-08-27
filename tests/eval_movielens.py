@@ -202,6 +202,7 @@ def eval_users(users, df, embeddings, index, tags_df, recommend_movies,
     rng = np.random.default_rng(seed)
     vote_ok = dict(zip(df["id"].astype(str), df["vote_count"] >= MIN_VOTES))
     per_user = {m: {"r10": [], "r20": [], "r50": [], "hit20": []} for m in methods}
+    eval_uids = []          # uids in result order, for paired comparison
     skipped = 0
 
     for n_done, (uid, ratings) in enumerate(users.items(), 1):
@@ -221,6 +222,7 @@ def eval_users(users, df, embeddings, index, tags_df, recommend_movies,
         if "pop" in methods:
             ranked["pop"] = rank_popularity(train, df)
 
+        eval_uids.append(uid)
         for m, ids in ranked.items():
             for K, key in ((10, "r10"), (20, "r20"), (50, "r50")):
                 topk = set(ids[:K])
@@ -238,6 +240,15 @@ def eval_users(users, df, embeddings, index, tags_df, recommend_movies,
         for key in ("r10", "r20", "r50", "hit20"):
             a = np.array(per_user[m][key])
             row[key] = (float(a.mean()), float(a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else 0.0)
+        # Raw per-user vector, kept so ablation rows can be compared PAIRED.
+        # Every config runs on the same users with the same seeded splits, so
+        # the between-user variance is shared and cancels in the difference.
+        # Reporting independent-sample error bars on a paired design is far too
+        # conservative: the tag-layer ablation measured -31% recall@20 with an
+        # independent band that included zero, purely because users differ
+        # wildly from each other.
+        row["_raw"] = {k: list(per_user[m][k]) for k in ("r10", "r20", "r50", "hit20")}
+        row["_uids"] = list(eval_uids)
         summary[m] = row
     return summary, n
 
@@ -357,8 +368,9 @@ def enrichment_cost(users, df, embeddings, index, tags_df, recommend_movies):
     kid_cost = by["kids filter OFF"]["r20"][0] - base["r20"][0]
     rt_cost = by["runtime floor OFF"]["r20"][0] - base["r20"][0]
     se = base["r20"][1]
-    print(f"stderr on the base recall@20 is ±{se:.4f}; treat gaps under ~{2*se:.4f}")
-    print("as noise rather than a measured cost.\n")
+    print_paired(rows, "shipped (rt20 + kids)", key="r20")
+    print(f"\n(the unpaired stderr on the base was ±{se:.4f}; the paired numbers")
+    print("above are the ones to trust for a same-users comparison)\n")
     print(f"  kids filter  costs {kid_cost:+.4f} recall@20 "
           f"({'within noise' if abs(kid_cost) < 2*se else 'REAL'})")
     print(f"  runtime floor costs {rt_cost:+.4f} recall@20 "
@@ -406,6 +418,7 @@ def pop_sweep(users, df, embeddings, index, tags_df, recommend_movies):
           f"{rp['r50'][0]:>12.4f}{rp['hit20'][0]:>10.3f}")
     print("=" * 78)
 
+    print_paired([(f"w={w}", r) for w, r in rows], "w=0.0", key="r20")
     best = max(rows, key=lambda x: x[1]["r20"][0])
     gap = rp["r20"][0] - base["r20"][0]
     recovered = (best[1]["r20"][0] - base["r20"][0]) / gap if gap else 0.0
@@ -416,6 +429,43 @@ def pop_sweep(users, df, embeddings, index, tags_df, recommend_movies):
     print("Check the actual output at the chosen weight before shipping it: if")
     print("the top 20 turn into films anyone could have named, the recall gain")
     print("bought nothing a user wanted.")
+
+
+def paired_delta(base_row, var_row, key="r20"):
+    """Paired difference between two configs on the SAME users.
+
+    Both runs use identical seeded splits, so pairing by uid removes the
+    between-user variance that dominates recall. The unpaired stderr answers
+    "how much do users differ", which is not the question -- the question is
+    "does turning this component off change the SAME user's result".
+    Returns (mean_delta, paired_stderr, n).
+    """
+    bu = {u: v for u, v in zip(base_row["_uids"], base_row["_raw"][key])}
+    vu = {u: v for u, v in zip(var_row["_uids"], var_row["_raw"][key])}
+    shared = [u for u in bu if u in vu]
+    if len(shared) < 2:
+        return 0.0, 0.0, len(shared)
+    d = np.array([vu[u] - bu[u] for u in shared])
+    return float(d.mean()), float(d.std(ddof=1) / np.sqrt(len(d))), len(d)
+
+
+def print_paired(rows, base_name, key="r20"):
+    base = dict(rows)[base_name]
+    print(f"\nPAIRED vs '{base_name}' on {key} (same users, same splits)")
+    print("-" * 74)
+    print(f"{'variant':<26}{'delta':>10}{'± paired se':>14}{'t':>8}   verdict")
+    for name, row in rows:
+        if name == base_name or "_raw" not in row:
+            continue
+        d, se, n = paired_delta(base, row, key)
+        t = d / se if se else 0.0
+        verdict = "REAL" if abs(t) >= 2 else "noise"
+        print(f"{name:<26}{d:>+10.4f}{se:>14.4f}{t:>8.1f}   {verdict}")
+    print("-" * 74)
+    print("t = delta / paired stderr. |t| >= 2 is roughly the 95% threshold.")
+    print("Compare against the unpaired bars above: pairing usually shrinks the")
+    print("interval several-fold, because it stops charging between-user")
+    print("variance to a within-user comparison.")
 
 
 def ablate(users, df, embeddings, index, tags_df, recommend_movies):
@@ -444,6 +494,13 @@ def ablate(users, df, embeddings, index, tags_df, recommend_movies):
     print("=" * 74)
     print("Read: whichever off-switch RAISES recall names the component that hurts")
     print("at this rating scale. 'flat' isolates scoring from diversity selection.")
+
+    # The unpaired ± above is the wrong test for this table. Every row ran on
+    # the same users with the same seeded splits, so the comparison is within
+    # -subject and the between-user variance cancels.
+    base_name = ABLATIONS[0][0]
+    print_paired(rows, base_name, key="r20")
+    print_paired(rows, base_name, key="hit20")
 
 
 def main():
