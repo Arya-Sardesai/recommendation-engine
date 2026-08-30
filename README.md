@@ -164,6 +164,20 @@ Matching on title alone had the same problem at 2.36M rows. Searching for an S. 
 
 The descriptions were never missing. They were sitting behind an API that Goodreads shut down in 2020.
 
+## Repo layout
+
+```
+app.py                       the serving app: ranker, cross-modal, Streamlit UI
+src/                         chat interface over the same corpora (Claude Haiku)
+notebooks/pipeline/          corpus build, enrichment, tagging, embedding, probes
+notebooks/pipeline/oneshot/  one-time migrations, kept for the record
+scripts/                     TMDB bulk fetch, artifact upload to the Datasets repo
+tests/                       evaluation harnesses and smoke tests
+Makefile                     the pipeline stage graph
+```
+
+The app is mirrored to the Hugging Face Space, which is what serves the live demo. This repo is the source of truth for it.
+
 ## Tech stack
 
 Python 3.11, SentenceTransformers (BGE-M3), FAISS, Streamlit, the Anthropic SDK (Claude Haiku), Hugging Face Spaces and Datasets, Docker, pandas, numpy, pyarrow. Embeddings are computed on an RTX 4060 locally. Serving is CPU only.
@@ -184,6 +198,8 @@ Python 3.11, SentenceTransformers (BGE-M3), FAISS, Streamlit, the Anthropic SDK 
 
 **One profile at a time.** There is no multi-user backend yet.
 
+**The serving app is one large module.** Three near-identical rankers share a file, which is how it grew and not how it should stay. Splitting it is part of the v2 rebuild.
+
 ## Roadmap
 
 **v2.** Refresh the data layer first as one chunk: new TMDB pull, keyword tagging for films and TV, upgraded embeddings. Then rebuild the web app as separate shippable pieces: React, FastAPI, Postgres, and login. Data before app, so I am not redoing the data layer twice.
@@ -192,7 +208,7 @@ Python 3.11, SentenceTransformers (BGE-M3), FAISS, Streamlit, the Anthropic SDK 
 
 ## Running it locally
 
-The live demo is the easy way to try it. To run the app locally you need the precomputed embeddings and index from the companion Datasets repo, since they are too big for git. With those in place it is a normal Streamlit app:
+The live demo is the easy way to try it. To run the app locally you need the precomputed embeddings and index from the companion Datasets repo, since they are too big for git. Copy `.env.example` to `.env` and fill in your keys, then:
 
 ```bash
 python -m streamlit run app.py
