@@ -36,10 +36,10 @@ sys.path.insert(0, str(HERE))
 import embed_books as EB  # noqa: E402  — the source of truth for the recipe
 
 PROCESSED = Path("data/processed")
-NEW_CORPUS = PROCESSED / "books_v2_hc2.parquet"
-OLD_EMB = PROCESSED / "book_embeddings_bgem3_v2_hc_notitle.npy"
-OUT_EMB = PROCESSED / "book_embeddings_bgem3_v2_hc2_notitle.npy"
-OUT_FAISS = PROCESSED / "book_faiss_bgem3_v2_hc2_notitle.index"
+NEW_CORPUS = PROCESSED / "books_v2_hc3.parquet"
+OLD_EMB = PROCESSED / "book_embeddings_bgem3_v2_hc2_notitle.npy"   # the LIVE vectors
+OUT_EMB = PROCESSED / "book_embeddings_bgem3_v2_hc3_notitle.npy"
+OUT_FAISS = PROCESSED / "book_faiss_bgem3_v2_hc3_notitle.index"
 
 
 def main():

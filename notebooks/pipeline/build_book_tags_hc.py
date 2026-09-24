@@ -62,11 +62,15 @@ TAG_SOURCES = [
     FILTERED_PATH,
     RAW_DIR / "targeted_raw.jsonl",
     RAW_DIR / "rescued_raw.jsonl",
+    # the 882-book author sweep. Without this line those rows get no tags and
+    # the warning below fires -- the exact silent gap that left the 20
+    # rescued books untagged the first time.
+    RAW_DIR / "sweep_raw.jsonl",
 ]
 
 PROCESSED = Path("data/processed")
-CORPUS = PROCESSED / "books_v2_hc2.parquet"
-OUT = PROCESSED / "book_tags_v2_hc2.parquet"
+CORPUS = PROCESSED / "books_v2_hc3.parquet"
+OUT = PROCESSED / "book_tags_v2_hc3.parquet"
 
 USE_CATEGORIES = ("Genre", "Mood")   # not "Tag" (noisy) or "Content Warning"
 MIN_COUNT = 1            # a tag one person applied is not evidence
