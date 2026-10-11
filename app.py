@@ -45,10 +45,15 @@ DATASET_REPO = "Arya2305/recommendation-engine-data"
 # B_EMB = "embeddings_bgem3.npy"                   # v1 Goodreads — rollback
 # B_FAISS = "faiss_bgem3.index"                    # v1 Goodreads — rollback
 # B_TAGS = "book_tags_knn.parquet"                 # v1 kNN tags — rollback
-B_CORPUS = "books_v2_hc2.parquet"
-B_EMB    = "book_embeddings_bgem3_v2_hc2_notitle.npy"
-B_FAISS  = "book_faiss_bgem3_v2_hc2_notitle.index"
-B_TAGS   = "book_tags_v2_hc2.parquet"
+B_CORPUS = "books_v2_hc3.parquet"                      # +882 author-sweep books
+B_EMB    = "book_embeddings_bgem3_v2_hc3_notitle.npy"
+B_FAISS  = "book_faiss_bgem3_v2_hc3_notitle.index"
+B_TAGS   = "book_tags_v2_hc3.parquet"
+# One LLM-assigned FORM label per book (novel / memoir / reportage / ...), from
+# the Haiku tagging run. Used ONLY by the shelf gate in recommend_books -- the
+# LLM register tags were measured against the Hardcover tags on goodbooks and
+# lost (t=-2.1), so they are not in B_TAGS. Missing file = gate is a no-op.
+B_FORMS  = "book_forms_v3.parquet"
 # movies
 # M_CORPUS = "movies.parquet"                      # pre-enrichment — rollback
 # v2 meta: adds runtime (refreshed from TMDB), certification and cert_tier.
@@ -83,15 +88,27 @@ st.set_page_config(page_title="Recommendation Engine", page_icon="sparkles", lay
 st.markdown("""
 <style>
 @media (max-width: 640px) {
-  /* 1. Force st.columns([3,1.2]) to stack instead of crushing the dropdown */
-  [data-testid="stHorizontalBlock"] {
+  /* 1. Force st.columns([3,1.2]) to stack instead of crushing the dropdown.
+     Scoped with :not(:has(...)) so it applies only to blocks of exactly two
+     columns -- which is every st.columns call in this file EXCEPT
+     rated_list_pager, which builds up to nine. Unscoped, eight pages of
+     ratings rendered as eight full-width stacked buttons on a phone. */
+  [data-testid="stHorizontalBlock"]:not(:has(> [data-testid="stColumn"]:nth-child(3))) {
     flex-wrap: wrap !important;
     gap: 0.75rem !important;
   }
-  [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+  [data-testid="stHorizontalBlock"]:not(:has(> [data-testid="stColumn"]:nth-child(3)))
+    > [data-testid="stColumn"] {
     flex: 1 1 100% !important;
     width: 100% !important;
     min-width: 100% !important;
+  }
+
+  /* The pager keeps its row, but drops the trailing spacer column so the
+     page numbers get the full width instead of sharing it with an empty one. */
+  [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3))
+    > [data-testid="stColumn"]:last-child {
+    display: none !important;
   }
 
   /* 2. Tap targets: 44px min, 16px font (16px also stops iOS auto-zoom on focus) */
@@ -106,6 +123,12 @@ st.markdown("""
   [data-testid="stTextInput"] input {
     font-size: 16px !important;
   }
+
+  /* 3. Poster shrinks so the text beside it keeps a readable measure. At 360px
+     a 92px poster plus its gap left ~250px for title, meta, cast and
+     attribution, which wrapped every line. */
+  .rec-poster { width: 68px; height: 102px; }
+  .rec-row { gap: 10px; }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -134,6 +157,10 @@ st.markdown(
         --brass:       #c9a86a;
         --sage:        #9bbf9b;
         --slate:       #7a9ec9;
+        --muted:       #a89f93;   /* watch-link rest state; was undefined, so
+                                     var(--muted) computed to unset and the
+                                     links inherited Streamlit's link blue --
+                                     exactly what the rule below exists to stop */
         --radius:      10px;
         --radius-sm:   6px;
         --ease:        cubic-bezier(0.2, 0.6, 0.3, 1);
@@ -192,7 +219,7 @@ st.markdown(
         color: var(--muted) !important;
         text-decoration: none !important;
         border-bottom: 1px solid transparent;
-        transition: color var(--ease), border-color var(--ease);
+        transition: color var(--t), border-color var(--t);
     }
     .rec-body a.watch-link:hover,
     a.watch-link:hover {
@@ -818,6 +845,24 @@ def load_books_index():
     return faiss.read_index(_dl(B_FAISS))
 
 
+_NONFIC_FORMS = {"memoir", "biography", "reportage", "history", "essays",
+                 "criticism", "science-writing", "travel-writing", "self-help",
+                 "reference", "true-crime", "philosophy", "polemic"}
+_FICTION_FORMS = {"novel", "novella", "short-stories", "poetry", "play",
+                  "graphic-novel"}
+
+
+@st.cache_resource
+def load_books_forms():
+    """book_id -> form. Empty dict (gate off) if the file is not there."""
+    try:
+        fdf = pd.read_parquet(_dl(B_FORMS))
+        return dict(zip(fdf["book_id"].astype(str), fdf["form"].astype(str)))
+    except Exception as e:
+        print(f"Book forms unavailable (shelf gate off): {e}")
+        return {}
+
+
 @st.cache_resource
 def load_books_tags():
     try:
@@ -1047,7 +1092,12 @@ def recommend_books_from_watching(ratings, src_df, src_emb, b_df, b_emb, b_index
     # Score every candidate against the WHOLE profile, not just its finder.
     scored = []
     for bi in cand:
-        if str(b_df.iloc[bi]["book_id"]) in skip or rc.iloc[bi] < min_ratings:
+        # same exemption as recommend_books, or the 882 hand-picked books are
+        # reachable from the Books tab and invisible from "From your films"
+        _curated = ("source" in b_df.columns
+                    and b_df.iloc[bi]["source"] == "targeted_authors")
+        if str(b_df.iloc[bi]["book_id"]) in skip or (
+                rc.iloc[bi] < min_ratings and not _curated):
             continue
         bv = _vec(b_emb, bi)
         sims = L @ bv
@@ -1166,7 +1216,8 @@ def recommend_books(ratings, df, embeddings, index, tags_df=None, n=20,
                     skip_ids=None, neutral=3.0, cross_weight=0.35, neg_scale=1.0,
                     genre_cap=6, retrieve_k=150, author_adjacent_penalty=0.30,
                     quality_weight=0.12, min_avg_rating=3.6, shrink_ratings=50,
-                    hardcover_ratings_scale=1.0, untagged_as_zero=True):
+                    hardcover_ratings_scale=1.0, untagged_as_zero=True,
+                    forms=None, shelf_penalty=0.10, anchor_tag_mix=0.5):
     """Whole-profile ranking (same design as recommend_movies).
 
     Per-anchor retrieval preserves distinct taste modes; scoring uses the full
@@ -1315,6 +1366,39 @@ def recommend_books(ratings, df, embeddings, index, tags_df=None, n=20,
     per_anchor_queues = []
     for like_i, (sims, idxs) in enumerate(zip(all_sims, all_idxs)):
         seed_tokens = _title_tokens(liked[like_i].get("matched_title", ""))
+        # SHELF GATE. A non-fiction anchor was returning novels 60% of the
+        # time (Dongri to Dubai -> the Daevabad trilogy): a book ABOUT the
+        # Mumbai underworld and a novel SET in it share every content word, so
+        # the embedding cannot tell them apart. The LLM form label can.
+        #
+        # One-directional on purpose. The form labeller's known errors run the
+        # other way -- it calls fiction-written-as-nonfiction (World War Z,
+        # Fire & Blood) non-fiction, and called Walkabout, a travel memoir, a
+        # novel. Gating only from non-fiction anchors means a mislabelled
+        # FICTION anchor changes nothing. And it is a penalty, not a filter:
+        # if an anchor's neighbourhood has no non-fiction, novels still come.
+        _a_nf = bool(forms) and (
+            forms.get(str(liked[like_i].get("book_id"))) in _NONFIC_FORMS)
+        # PER-ANCHOR TAG PROFILE. The tag layer used to score every candidate
+        # against ONE profile averaged over the whole library. For a 53-book
+        # profile that average is "funny, emotional, adventurous" (Hitchhiker's,
+        # Scott Pilgrim, A.J. Fikry), so under The Ax -- a dark satirical
+        # thriller -- it lifted a Lucy Score small-town romance from outside
+        # the raw top 25 past The Firm and Roadwork, because the romance fits
+        # the reader's AVERAGE mood. Candidates pulled in by an anchor are now
+        # judged against a blend of the whole profile and that anchor's own
+        # tags (unit-normalised, so neither side dominates by magnitude).
+        # 0 = old behaviour; 1 = anchor tags only.
+        prof_a = tag_profile
+        if tag_profile is not None and anchor_tag_mix:
+            _abid = str(liked[like_i].get("book_id"))
+            if _abid in tags_df.index:
+                _av = np.asarray(tags_df.loc[_abid].values, dtype="float32")
+                _gn = float(np.linalg.norm(tag_profile))
+                _an = float(np.linalg.norm(_av))
+                if _gn > 0 and _an > 0:
+                    prof_a = ((1.0 - anchor_tag_mix) * tag_profile / _gn
+                              + anchor_tag_mix * _av / _an)
         queue = []
         for sim, idx in zip(sims, idxs):
             if idx < 0:
@@ -1328,6 +1412,15 @@ def recommend_books(ratings, df, embeddings, index, tags_df=None, n=20,
             _src = book["source"] if "source" in df.columns else "goodreads"
             _floor = (min_ratings * hardcover_ratings_scale
                       if _src == "hardcover" else min_ratings)
+            # Hand-picked authors bypass the floor. The floor exists to keep
+            # lightly-read noise out, and the A/B showed it does: lowering it
+            # globally surfaced romantasy filler and displaced better books.
+            # But these 882 rows were chosen deliberately, not scraped by
+            # popularity, and their median ratings_count is 1 -- the floor would
+            # hide every one, making them ratable as anchors but never
+            # recommended (the Imaginary Maps failure, 882 times over).
+            if _src == "targeted_authors":
+                _floor = 0
             if book["ratings_count"] < _floor:
                 continue
 
@@ -1359,13 +1452,13 @@ def recommend_books(ratings, df, embeddings, index, tags_df=None, n=20,
 
             tag_sim = None
             match_tags = []
-            if tag_profile is not None and str(book["book_id"]) in tags_df.index:
+            if prof_a is not None and str(book["book_id"]) in tags_df.index:
                 book_tags = tags_df.loc[str(book["book_id"])].values
-                nu, nb = np.linalg.norm(tag_profile), np.linalg.norm(book_tags)
+                nu, nb = np.linalg.norm(prof_a), np.linalg.norm(book_tags)
                 if nu > 0 and nb > 0:
-                    tag_sim = float(np.dot(tag_profile, book_tags) / (nu * nb))
+                    tag_sim = float(np.dot(prof_a, book_tags) / (nu * nb))
                     _all_tag_sims.append(tag_sim)
-                    match_tags = _matching_tags(tag_profile, book_tags, tags_df.columns)
+                    match_tags = _matching_tags(prof_a, book_tags, tags_df.columns)
 
             btoks = _title_tokens(book["title"])
             shared = seed_tokens & btoks
@@ -1392,6 +1485,10 @@ def recommend_books(ratings, df, embeddings, index, tags_df=None, n=20,
                 if (btoks & _COMPANION_MARKERS) and (
                         (btoks & rated_title_tokens) - _COMPANION_MARKERS):
                     title_pen += author_adjacent_penalty
+
+            if _a_nf and shelf_penalty and \
+                    forms.get(str(book["book_id"])) in _FICTION_FORMS:
+                title_pen += shelf_penalty
 
             queue.append([int(idx), emb_score, tag_sim, title_pen, cross_anchor_i, cross_val, match_tags])
         per_anchor_queues.append({"like": liked[like_i], "queue": queue})
@@ -3166,6 +3263,7 @@ with st.spinner("Loading the recommendation engine (first load downloads data, ~
     b_index = load_books_index()
     b_emb = IndexVectors(b_index)
     b_tags = load_books_tags()
+    b_forms = load_books_forms()
     m_df = load_movies_corpus()
     m_index = load_movies_index()
     m_emb = IndexVectors(m_index)
@@ -3414,7 +3512,8 @@ with books_tab:
                 st.warning("Rate at least one book 4 or higher.")
             else:
                 recs, tags = recommend_books(st.session_state.ratings, b_df, b_emb, b_index,
-                                             tags_df=b_tags, n=20, skip_ids=st.session_state.skipped)
+                                             tags_df=b_tags, n=20, skip_ids=st.session_state.skipped,
+                                             forms=b_forms)
                 if tags is not None and len(tags) > 0:
                     st.markdown(f"<div class='tag-hint'>Inferred taste signature: {', '.join(tags.index[:5])}</div>",
                                 unsafe_allow_html=True)
@@ -3926,7 +4025,7 @@ st.divider()
 #
 # Global rather than per-tab: a reader who bounces off one tab should still be
 # able to say so, and a second link inside each tab reads as nagging.
-FEEDBACK_URL = "https://forms.gle/REPLACE_ME"   # <- paste the Google Form link
+FEEDBACK_URL = "https://forms.gle/MpdcgDxBcjHnDv5v5"
 
 if "REPLACE_ME" not in FEEDBACK_URL:
     st.markdown(

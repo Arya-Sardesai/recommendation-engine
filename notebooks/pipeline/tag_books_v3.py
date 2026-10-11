@@ -32,9 +32,10 @@ import pandas as pd
 # import the merged taxonomy that sits next to this script
 sys.path.insert(0, str(Path(__file__).parent))
 from tag_taxonomy_v3 import ALL_BOOK_TAGS_V3 as ALL_BOOK_TAGS  # noqa: E402
+from tag_taxonomy_v3 import FORM_TAGS, NONFICTION_FORMS  # noqa: E402
 
 # ---- config ------------------------------------------------------------------
-MODE = "full"               # "pilot" then "full"
+MODE = "full"              # "pilot" FIRST (~$0.20), then "full" (~$21)
 MIN_RATINGS = 0        # v3 tags the WHOLE corpus; see docstring         # full: tag untagged books with >= this many ratings
 RETAG_EXISTING = True  # the v1 ids are Goodreads; only 263 survive the swap        # full: also re-tag the existing 8,800 onto merged taxonomy
 N_PILOT = 300
@@ -64,6 +65,16 @@ ALIASES = {
     "comedic": "humorous",
     "suspenseful": "tense",
     "satirical": "satire",
+    "epic": "novel",                 # removed from FORM after the pilot
+    "romantic": "romance", "tragedy": "heart-wrenching", "tragic": "heart-wrenching",
+    "gothic": "atmospheric",
+    "short-story": "short-stories", "short-story-collection": "short-stories",
+    "essay": "essays", "essay-collection": "essays",
+    "graphic-novels": "graphic-novel", "comic": "graphic-novel", "manga": "graphic-novel",
+    "journalism": "reportage", "narrative-nonfiction": "reportage",
+    "autobiography": "memoir", "memoirs": "memoir",
+    "travelogue": "travel-writing", "travel": "travel-writing",
+    "popular-science": "science-writing", "poems": "poetry",
 }
 
 VOCAB = set(ALL_BOOK_TAGS)
@@ -85,8 +96,12 @@ def build_system_prompt():
         f"- Use ONLY these {len(VOCAB)} tags, exactly as written. Invent nothing, "
         "and do NOT use plain genre words (e.g. 'paranormal') that aren't in the list:\n"
         f"  {tag_list}\n"
-        f"- Choose {MIN_TAGS}-{MAX_TAGS} tags per book that best capture its feel, "
-        "structure, pace, and theme.\n"
+        f"- EVERY book gets EXACTLY ONE form tag, chosen from: {', '.join(sorted(FORM_TAGS))}. "
+        "Form is what KIND of book it is. A book ABOUT a crime is not a crime novel: "
+        "a journalist's account of the Mumbai underworld is `reportage`, a novel set in "
+        "it is `novel`. A memoir is `memoir` even when it reads like fiction.\n"
+        f"- Then choose {MIN_TAGS - 1}-{MAX_TAGS - 1} more tags that best capture its feel, "
+        "prose, pace, and theme.\n"
         "- Score each 0.2-1.0. Reserve 1.0 for a defining, quintessential quality; "
         "most scores are 0.6-0.9. Order each book's tags by score, highest first.\n\n"
         "OUTPUT -- one line per book, nothing else, no preamble, no JSON:\n"
@@ -131,6 +146,15 @@ def parse_response(text, sent_ids):
             except ValueError:
                 continue
             best[ct] = max(best.get(ct, 0.0), score)
+        # EXACTLY ONE form tag, enforced here rather than hoped for in the
+        # prompt. The pilot got 80% compliance from instructions alone; keeping
+        # the highest-scoring form makes it 100% by construction.
+        forms = [t for t in best if t in FORM_TAGS]
+        if len(forms) > 1:
+            keep = max(forms, key=lambda t: best[t])
+            for t in forms:
+                if t != keep:
+                    del best[t]
         pairs = sorted(best.items(), key=lambda x: -x[1])[:MAX_TAGS]
         if pairs:
             got[bid] = pairs
@@ -186,6 +210,14 @@ def run_pilot(client, system, cand):
     cost = (tot["inp"] * PRICE_IN + tot["cr"] * PRICE_CACHE_READ +
             tot["cw"] * PRICE_CACHE_WRITE + tot["out"] * PRICE_OUT) / 1e6
     report(out, dropped, misaligned, len(blist))
+    titles = dict(zip(cand["book_id"].astype(str), cand["title"]))
+    print("\nSAMPLE -- read these. Do they describe how the book READS?")
+    ids = list(dict.fromkeys(out["book_id"].astype(str)))
+    for bid in ids[:: max(1, len(ids) // 14)][:14]:
+        tg = out[out["book_id"].astype(str) == bid].sort_values("score", ascending=False)
+        form = next((t for t in tg["tag"] if t in FORM_TAGS), "?")
+        rest = ", ".join(t for t in tg["tag"] if t not in FORM_TAGS)
+        print(f"  [{form:>13}] {str(titles.get(bid, bid))[:38]:40s} {rest}")
     print(f"\nPILOT cost: ${cost:.4f}  (realtime). Wrote {PILOT_OUT}")
     print("If dropped~0 and tags look right -> set MODE='full' and run again.")
 
@@ -246,14 +278,29 @@ def run_full(client, system, cand):
     print(f"\nMERGED tag file: {merged['book_id'].nunique():,} books, {len(merged):,} rows -> {OUT_MERGED}")
     # batch is already 50% off; report measured output as the dominant term
     print(f"(batch output tokens: {tot_out:,})")
-    print("\nNEXT: upload book_tags_v2.parquet (rename to book_tags.parquet or repoint")
-    print("B_TAGS), restart the Space, then raise books tag_weight back toward 0.3.")
+    print(f"\nNEXT: run eval_goodbooks with B_TAGS -> {OUT_MERGED.name} against 0.016,")
+    print("then upload it and flip B_TAGS in app.py if it holds up.")
     print(f"Delete {STATE_FILE.name} once you've confirmed the merged file is good.")
 
 
 def report(df, dropped, misaligned, n_batches, label="TAGGED"):
     if df.empty:
         print("  (no rows produced)"); return
+    # THE CHECK THAT MATTERS: the shelf gate needs one form tag per book.
+    n_form = df[df["tag"].isin(FORM_TAGS)].groupby("book_id").size()
+    books = df["book_id"].nunique()
+    exactly_one = int((n_form == 1).sum())
+    none = books - len(n_form)
+    print(f"\nFORM TAGS: {exactly_one}/{books} books have exactly one "
+          f"({exactly_one / max(books, 1):.0%}); {none} have none; "
+          f"{int((n_form > 1).sum())} have several")
+    fc = df[df["tag"].isin(FORM_TAGS)]["tag"].value_counts()
+    nf = int(df[df["tag"].isin(NONFICTION_FORMS)]["book_id"].nunique())
+    print(f"  non-fiction share: {nf}/{books} ({nf / max(books, 1):.0%})")
+    print("  " + ", ".join(f"{t} {c}" for t, c in fc.head(12).items()))
+    if exactly_one < 0.9 * books:
+        print("  >> under 90% -- the shelf gate cannot rely on this yet. Fix the")
+        print("     prompt before paying for the full run.")
     per = df.groupby("book_id").size()
     print("\n" + "=" * 56)
     print(f"{label} {df['book_id'].nunique():,} books | {len(df):,} rows | "
@@ -267,8 +314,8 @@ def report(df, dropped, misaligned, n_batches, label="TAGGED"):
 
 
 def main():
-    if not CORPUS.exists() or not TAGS.exists():
-        raise SystemExit("Missing books_v1.parquet / book_tags.parquet in data/processed.")
+    if not CORPUS.exists():
+        raise SystemExit(f"Missing {CORPUS.name} in data/processed.")
     try:
         from anthropic import Anthropic
     except ImportError:

@@ -164,45 +164,52 @@ def load_users(ratings_csv, links, n_users, seed=SEED):
 
 
 def eval_users(users, df, emb, index, tags_df, recommend_books, params=None,
-               k_list=(10, 20, 50), seed=SEED, label=""):
+               k_list=(10, 20, 50), seed=SEED, label="", folds=1):
+    """folds=1: one random 70/30 split per user (the original protocol).
+    folds=K: each user's ratings are cut into K parts and each part is the
+    test set once, train on the rest; the user's score is the mean over
+    folds. Same users and same splits for every config (seeded), so the
+    per-user scores stay paired."""
     params = params or {}
     rng = np.random.default_rng(seed)
     acc = {k: [] for k in k_list}
     hit20, n_ok, skipped = [], 0, 0
+    per_user = []        # recall@20 per user, None if skipped -- for pairing
     maxk = max(k_list)
 
     for i, (uid, g) in enumerate(users.items(), 1):
         rows = g.sample(frac=1.0, random_state=int(rng.integers(1 << 30)))
-        cut = int(len(rows) * 0.7)
-        train_r, test_r = rows.iloc[:cut], rows.iloc[cut:]
-        relevant = {int(b) for b, r in zip(test_r["book_id"], test_r["rating"])
-                    if r >= LIKE}
-        if not relevant or len(train_r) < 5:
+        if folds <= 1:
+            cut = int(len(rows) * 0.7)
+            splits = [(rows.iloc[:cut], rows.iloc[cut:])]
+        else:
+            parts = np.array_split(np.arange(len(rows)), folds)
+            splits = [(rows.drop(rows.index[p]), rows.iloc[p]) for p in parts]
+        u_acc = {k: [] for k in k_list}
+        u_hit, u_r20 = [], []
+        failed = False
+        for train_r, test_r in splits:
+            relevant = {int(b) for b, r in zip(test_r["book_id"], test_r["rating"])
+                        if r >= LIKE}
+            if not relevant or len(train_r) < 5:
+                continue
+            res = _score_split(train_r, relevant, df, emb, index, tags_df,
+                               recommend_books, params, k_list, maxk, uid)
+            if res is None:
+                failed = True
+                break
+            for k in k_list:
+                u_acc[k].append(res[k])
+            u_hit.append(res["hit"])
+            u_r20.append(res[20] if 20 in res else res[k_list[0]])
+        if failed or not u_r20:
             skipped += 1
+            per_user.append(None)
             continue
-
-        ratings = []
-        for b, r in zip(train_r["book_id"], train_r["rating"]):
-            ci = LINKS[int(b)]
-            row = df.iloc[ci]
-            ratings.append({"book_id": str(row["book_id"]),
-                            "matched_title": row["title"],
-                            "matched_author": row.get("primary_author", ""),
-                            "corpus_index": int(ci), "rating": float(r)})
-        try:
-            recs, _ = recommend_books(ratings, df, emb, index,
-                                      tags_df=tags_df, n=maxk, **params)
-        except Exception as e:
-            print(f"    user {uid} failed: {type(e).__name__}: {e}")
-            skipped += 1
-            continue
-
-        got_ci = list(recs["corpus_index"]) if "corpus_index" in recs.columns else []
-        rel_ci = {LINKS[b] for b in relevant if b in LINKS}
         for k in k_list:
-            top = set(got_ci[:k])
-            acc[k].append(len(top & rel_ci) / max(len(rel_ci), 1))
-        hit20.append(1.0 if set(got_ci[:20]) & rel_ci else 0.0)
+            acc[k].append(float(np.mean(u_acc[k])))
+        hit20.append(float(np.mean(u_hit)))
+        per_user.append(float(np.mean(u_r20)))
         n_ok += 1
         if i % 25 == 0:
             print(f"  {label}[{i}/{len(users)}] evaluated...")
@@ -214,7 +221,32 @@ def eval_users(users, df, emb, index, tags_df, recommend_books, params=None,
     out = {f"r{k}": ms(acc[k]) for k in k_list}
     out["hit20"] = ms(hit20)
     print(f"  {label}evaluated {n_ok} users ({skipped} skipped)")
+    out["_per_user"] = per_user
     return out, n_ok
+
+
+def _score_split(train_r, relevant, df, emb, index, tags_df, recommend_books,
+             params, k_list, maxk, uid):
+    ratings = []
+    for b, r in zip(train_r["book_id"], train_r["rating"]):
+        ci = LINKS[int(b)]
+        row = df.iloc[ci]
+        ratings.append({"book_id": str(row["book_id"]),
+                        "matched_title": row["title"],
+                        "matched_author": row.get("primary_author", ""),
+                        "corpus_index": int(ci), "rating": float(r)})
+    try:
+        recs, _ = recommend_books(ratings, df, emb, index,
+                                  tags_df=tags_df, n=maxk, **params)
+    except Exception as e:
+        print(f"    user {uid} failed: {type(e).__name__}: {e}")
+        return None
+
+    got_ci = list(recs["corpus_index"]) if "corpus_index" in recs.columns else []
+    rel_ci = {LINKS[b] for b in relevant if b in LINKS}
+    res = {k: len(set(got_ci[:k]) & rel_ci) / max(len(rel_ci), 1) for k in k_list}
+    res["hit"] = 1.0 if set(got_ci[:20]) & rel_ci else 0.0
+    return res
 
 
 def eval_pop(users, df, k_list=(10, 20, 50)):
@@ -244,17 +276,61 @@ def eval_pop(users, df, k_list=(10, 20, 50)):
     return {f"r{k}": ms(acc[k]) for k in k_list} | {"hit20": ms(hit20)}
 
 
+def load_tag_matrix(path):
+    t = pd.read_parquet(path)
+    t["book_id"] = t["book_id"].astype(str)
+    return t.pivot_table(index="book_id", columns="tag", values="score",
+                         fill_value=0.0)
+
+
+def paired_t(base, other):
+    """Paired per user: the correction that reversed the movie ablation.
+    Positive delta = `other` beats `base`."""
+    d = np.array([b - a for a, b in zip(base, other)
+                  if a is not None and b is not None], dtype=float)
+    if len(d) < 2 or d.std(ddof=1) == 0:
+        return (float(d.mean()) if len(d) else 0.0), 0.0
+    return float(d.mean()), float(d.mean() / (d.std(ddof=1) / np.sqrt(len(d))))
+
+
+def paired_bootstrap(a, b, n_boot=10000, seed=SEED):
+    """95% CI of mean(b - a) over users, resampling users with replacement,
+    and the share of resamples where b is worse than a."""
+    d = np.array([y - x for x, y in zip(a, b) if x is not None and y is not None])
+    if len(d) < 2:
+        return 0.0, 0.0, 0.0, 0.5
+    rng = np.random.default_rng(seed)
+    means = d[rng.integers(0, len(d), size=(n_boot, len(d)))].mean(axis=1)
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return float(d.mean()), float(lo), float(hi), float((means < 0).mean())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--gb-dir", required=True,
                     help="folder with books.csv and ratings.csv")
     ap.add_argument("--users", type=int, default=100)
+    ap.add_argument("--folds", type=int, default=1,
+                    help="K-fold per user (each part held out once); 1 = the "
+                         "original single 70/30 split. Runtime scales with K.")
     ap.add_argument("--relink", action="store_true")
     ap.add_argument("--as-deployed", action="store_true",
                     help="measure the shipped config, suppressors and all, "
                          "instead of the scoring-only protocol")
     ap.add_argument("--ablate", action="store_true",
                     help="one component off per row")
+    ap.add_argument("--compare-tags", default=None, metavar="PARQUET",
+                    help="A/B the live tag layer against this tag file, paired "
+                         "per user, e.g. data\\processed\\book_tags_v3_llm.parquet")
+    ap.add_argument("--anchor-mix", action="store_true",
+                    help="A/B the per-anchor tag profile (anchor_tag_mix) "
+                         "against the old whole-profile tags, paired per user")
+    ap.add_argument("--shelf-idf", action="store_true",
+                    help="A/B tag IDF weighting and the neighbourhood genre "
+                         "bonus against the current default ranker")
+    ap.add_argument("--neg-floor", action="store_true",
+                    help="A/B the dislike floor, similarity stretch and "
+                         "per-anchor tag mix against the old shipped ranker")
     args = ap.parse_args()
 
     gb = Path(args.gb_dir)
@@ -287,6 +363,113 @@ def main():
     print("  protocol:", "AS DEPLOYED (diversity layer on)" if args.as_deployed
           else "SCORING ONLY (author suppressors + caps lifted)")
     rows = []
+    if args.shelf_idf:
+        CONFIGS = [
+            ("current default",        {}),
+            ("tag idf 0.5",            {"tag_idf": 0.5}),
+            ("tag idf 1.0",            {"tag_idf": 1.0}),
+            ("genre +0.10",            {"genre_weight": 0.10}),
+            ("genre +0.20",            {"genre_weight": 0.20}),
+            ("idf 1.0 + genre 0.10",   {"tag_idf": 1.0, "genre_weight": 0.10}),
+        ]
+        base = "current default"
+    elif args.neg_floor:
+        OLD = {"anchor_tag_mix": 0.0, "neg_floor_k": 0, "sim_scale": 1.0}
+        F = {"anchor_tag_mix": 0.0, "neg_floor_k": 200}
+        CONFIGS = [
+            ("old (shipped)",          OLD),
+            ("floor only",             {**F, "sim_scale": 1.0}),
+            ("floor + sim x2",         {**F, "sim_scale": 2.0}),
+            ("floor + sim x3 (new)",   {**F, "sim_scale": 3.0}),
+            ("floor + sim x5",         {**F, "sim_scale": 5.0}),
+            ("floor + sim x3 + mix.5", {**F, "sim_scale": 3.0, "anchor_tag_mix": 0.5}),
+        ]
+        base = "old (shipped)"
+    elif args.anchor_mix:
+        base = "old (mix 0)"
+        CONFIGS = [
+            ("old (mix 0)",   {"anchor_tag_mix": 0.0}),
+            ("no tag layer",  {"tag_weight": 0.0}),
+            ("mix 0.25",      {"anchor_tag_mix": 0.25}),
+            ("mix 0.50",      {"anchor_tag_mix": 0.50}),
+            ("mix 0.75",      {"anchor_tag_mix": 0.75}),
+            ("mix 1.0",       {"anchor_tag_mix": 1.0}),
+        ]
+    if args.neg_floor or args.anchor_mix or args.shelf_idf:
+        per = {}
+        for name, params in CONFIGS:
+            merged = dict(base_params)
+            merged.update(params)
+            s_, _ = eval_users(users, df, emb, index, tags_df, rec,
+                               params=merged, label=f"{name}: ", folds=args.folds)
+            per[name] = s_.pop("_per_user")
+            rows.append((name, s_))
+        print("\n" + "=" * 92)
+        print(f"  {args.users} users, {args.folds}-fold"
+              + (" (single 70/30 split)" if args.folds <= 1 else ""))
+        print(f"{'method':<24}{'recall@20':>14}{'d r@20':>10}{'t':>6}"
+              f"{'95% CI (bootstrap)':>24}{'P(worse)':>10}")
+        print("-" * 92)
+        for name, r in rows:
+            line = f"{name:<24}{r['r20'][0]:>9.4f}±{r['r20'][1]:<4.3f}"
+            if name != base:
+                d, t = paired_t(per[base], per[name])
+                _, lo, hi, pw = paired_bootstrap(per[base], per[name])
+                flag = " <<" if (lo > 0 or hi < 0) else ""
+                line += (f"{d:>+10.4f}{t:>6.1f}"
+                         f"{f'[{lo:+.4f}, {hi:+.4f}]':>24}{pw:>9.0%}{flag}")
+            print(line)
+        print("=" * 92)
+        print("CI excludes 0 (<<) = a real difference. P(worse) = share of the")
+        print("10,000 user-resamples where that row loses to the baseline.")
+        print(f"Paired vs `{base}`. Ship the new config if it is not")
+        print("significantly WORSE (t > -2): goodbooks can't see the romance-")
+        print("under-a-thriller failure, so a tie is a win for the live app.")
+        return
+    if args.compare_tags:
+        alt_path = Path(args.compare_tags)
+        if not alt_path.exists():
+            raise SystemExit(f"{alt_path} not found")
+        alt = load_tag_matrix(alt_path)
+        print(f"  candidate tags: {alt.shape[0]:,} books x {alt.shape[1]} tags "
+              f"({alt_path.name})")
+        CONFIGS = [
+            ("live tags",           tags_df, {}),
+            ("no tag layer",        tags_df, {"tag_weight": 0.0}),
+            ("LLM tags",            alt,     {}),
+            ("LLM tags, w=0.40",    alt,     {"tag_weight": 0.40}),
+            ("LLM tags, w=0.60",    alt,     {"tag_weight": 0.60}),
+        ]
+        per = {}
+        for name, tmat, params in CONFIGS:
+            merged = dict(base_params)
+            merged.update(params)
+            s_, _ = eval_users(users, df, emb, index, tmat, rec,
+                               params=merged, label=f"{name}: ", folds=args.folds)
+            per[name] = s_.pop("_per_user")
+            rows.append((name, s_))
+        rows.append(("pop", eval_pop(users, df)))
+
+        print("\n" + "=" * 88)
+        print(f"{'method':<22}{'recall@10':>14}{'recall@20':>14}{'recall@50':>14}"
+              f"{'d r@20':>11}{'t':>7}")
+        print("-" * 88)
+        for name, r in rows:
+            line = (f"{name:<22}"
+                    f"{r['r10'][0]:>9.3f}±{r['r10'][1]:<4.3f}"
+                    f"{r['r20'][0]:>9.3f}±{r['r20'][1]:<4.3f}"
+                    f"{r['r50'][0]:>9.3f}±{r['r50'][1]:<4.3f}")
+            if name in per and name != "live tags":
+                d, t = paired_t(per["live tags"], per[name])
+                line += f"{d:>+11.4f}{t:>7.1f}{' <<' if abs(t) >= 2 else ''}"
+            print(line)
+        print("=" * 88)
+        print("d r@20 is the PAIRED per-user difference vs `live tags`.")
+        print("Positive = better than what ships now. |t| >= 2 is real; below")
+        print("that is noise however big the gap looks.")
+        print("\nShip the LLM tags only if an LLM row is >= live with |t| >= 2,")
+        print("or statistically tied AND the shelf gate needs them anyway.")
+        return
     if args.ablate:
         # The author cap is a LIVE setting, shipped at 1 since this morning to
         # stop two Martha Wells books appearing adjacent. The first ablation
@@ -313,11 +496,13 @@ def main():
             merged = dict(base_params)
             merged.update(params or {})
             s, _ = eval_users(users, df, emb, index, tags_df, rec,
-                              params=merged, label=f"{name}: ")
+                              params=merged, label=f"{name}: ", folds=args.folds)
+            s.pop("_per_user", None)
             rows.append((name, s))
     else:
         s, _ = eval_users(users, df, emb, index, tags_df, rec,
-                          params=base_params, label="new: ")
+                          params=base_params, label="new: ", folds=args.folds)
+        s.pop("_per_user", None)
         rows.append(("new", s))
     rows.append(("pop", eval_pop(users, df)))
 

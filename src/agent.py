@@ -1,580 +1,310 @@
 """
-Recommendation agent — multi-step reasoning over the book recommender.
+Book recommendation agent -- Claude (Haiku) with tools over the book catalogue.
 
-The agent (Claude) is given tools that wrap the existing recommender. It can:
-  - inspect the user's ratings (semantic search over what they've rated)
-  - get recommendations from anchor books, with optional year filters
-  - look up books in the catalog
-  - search by quality-tags across the near-full catalog (LLM + kNN-propagated)
+Ranking is NOT implemented here. get_recommendations calls the Space's own
+recommend_books through space_ranker, with the arguments the Books tab passes,
+so with no anchors the agent's list IS the website's list. The other tools are
+searches (catalogue, semantic, tags) that apply the same floors the ranker
+does, so they never surface a book the website would refuse to recommend.
 
-It runs an agentic loop: Claude decides which tools to call, we execute them,
-feed results back, and Claude continues until it produces a final answer.
-
-This module is UI-agnostic — it takes the loaded corpus/embeddings/index and a
-list of user ratings, and exposes `run_agent(user_message, ...)`.
+The app supplies state["bundle"] (space_ranker.load("book")), state["ratings"]
+and state["skipped"]. The agent adds caches to the same dict.
 
 Set key:  $env:ANTHROPIC_API_KEY = "sk-ant-..."
 """
-import json
 import numpy as np
-import pandas as pd
-from anthropic import Anthropic
 
-MODEL = "claude-haiku-4-5-20251001"
+import space_ranker as sr
+from agent_common import embed_query, run_agent_loop
+
+KIND = "book"
+
+
+def _b(state):
+    return state["bundle"]
+
+
+def _form(b, book_id):
+    return b["forms"].get(str(book_id)) if b["forms"] else None
+
+
+def _row(b, pos):
+    """A catalogue row as the model sees it."""
+    r = b["df"].iloc[int(pos)]
+    out = {"title": str(r["title"]), "author": sr.text(r.get("primary_author")),
+           "year": sr.year_of(r.get("publication_year")),
+           "genres": sr.book_genres(b, r.get("genres"))}
+    f = _form(b, r["book_id"])
+    if f:
+        out["form"] = f
+    blurb = sr.short(r.get("description"), 160)
+    if blurb:
+        out["blurb"] = blurb
+    return out
+
+
+def _rec_row(b, rec):
+    """A recommend_books result row: the pick plus the ranker's own reasons."""
+    out = {"title": str(rec["title"]), "author": sr.text(rec.get("author")),
+           "year": sr.year_of(rec.get("year")),
+           "genres": sr.book_genres(b, rec.get("genres")),
+           "because_of": rec.get("because_of")}
+    also = rec.get("also_because")
+    if isinstance(also, str) and also:
+        out["also_because"] = also
+    tags = [t for t in sr.as_list(rec.get("match_tags")) if t]
+    if tags:
+        out["matched_tags"] = tags
+    f = _form(b, rec.get("book_id"))
+    if f:
+        out["form"] = f
+    blurb = sr.short(rec.get("overview"))
+    if blurb:
+        out["blurb"] = blurb
+    return out
+
 
 # ---------------------------------------------------------------------------
-# Tool implementations — these wrap the real recommender logic.
-# Each takes the shared state (df, embeddings, index, ratings) plus tool args.
+# Tools
 # ---------------------------------------------------------------------------
-
-def _get_query_embedder(state):
-    """Lazy-load and cache the embedding model on state for query encoding."""
-    if "query_embedder" not in state:
-        from sentence_transformers import SentenceTransformer
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = SentenceTransformer("BAAI/bge-m3", device=device)
-        state["query_embedder"] = model
-    return state["query_embedder"]
-
-
 def _tool_search_user_ratings(state, query=None, top_k=8):
-    """Return the user's rated books. If a query is given, rank the user's books
-    by SEMANTIC similarity to the query (so 'my noir books' finds crime/noir by
-    meaning, not string match). Otherwise return all ratings."""
     ratings = state["ratings"]
     if not ratings:
-        return {"ratings": [], "note": "User has not rated any books yet."}
-
+        return {"ratings": [], "note": "The user has not rated any books yet."}
     if not query:
-        return {"ratings": [{"title": r["matched_title"],
-                             "author": r.get("matched_author", ""),
-                             "rating": r["rating"]} for r in ratings],
+        return {"ratings": [{"title": r["matched_title"], "author": r.get("matched_author", ""),
+                             "rating": r["rating"]}
+                            for r in sorted(ratings, key=lambda r: -r["rating"])],
                 "count": len(ratings)}
-
-    # semantic: embed the query, compare to each rated book's corpus embedding
-    embeddings = state["embeddings"]
-    model = _get_query_embedder(state)
-    qvec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
-
-    scored = []
-    for r in ratings:
-        bvec = embeddings[r["corpus_index"]]
-        sim = float(np.dot(qvec, bvec))  # both normalized -> cosine
-        scored.append((sim, r))
-    scored.sort(key=lambda x: -x[0])
-
-    top = scored[:top_k]
-    return {
-        "query": query,
-        "matched_books": [
-            {"title": r["matched_title"], "author": r.get("matched_author", ""),
-             "rating": r["rating"], "relevance": round(sim, 3)}
-            for sim, r in top
-        ],
-        "note": "Ranked by semantic similarity to the query. Higher relevance = closer match to what the user described."
-    }
+    b = _b(state)
+    q = embed_query(state, query)[0]
+    scored = sorted(((float(np.dot(q, b["emb"][r["corpus_index"]])), r) for r in ratings),
+                    key=lambda x: -x[0])
+    return {"query": query,
+            "ratings": [{"title": r["matched_title"], "author": r.get("matched_author", ""),
+                         "rating": r["rating"], "relevance": round(s, 3)}
+                        for s, r in scored[:int(top_k or 8)]],
+            "note": "The user's rated books, ranked by similarity in meaning to the query."}
 
 
-def _tool_get_recommendations(state, anchor_titles, n=10, min_year=None, max_year=None):
-    """Core recommender. Finds the anchor books among the user's ratings (by title),
-    uses their embeddings, returns nearest unread books with optional year filters."""
-    df = state["df"]; embeddings = state["embeddings"]; index = state["index"]
-    ratings = state["ratings"]
+def _tool_get_recommendations(state, anchor_titles=None, n=10, min_year=None, max_year=None,
+                              avoid_tags=None):
+    b, ratings = _b(state), state["ratings"]
+    avoid_cols = sr.resolve_tags(b, avoid_tags)[0] if b["tags"] is not None else []
+    n = max(1, min(int(n or 10), 20))
+    anchors, unresolved = [], []
+    for t in anchor_titles or []:
+        p = sr.resolve_title(b, t, ratings)
+        if p is None:
+            unresolved.append(t)
+        elif p not in anchors:
+            anchors.append(p)
+    if anchor_titles and not anchors:
+        return {"recommendations": [],
+                "note": f"None of {anchor_titles} are in the catalogue, so there is nothing to anchor on."}
 
-    # match anchor_titles to the user's rated books (so we use their corpus_index)
-    anchors = []
-    for at in anchor_titles:
-        for r in ratings:
-            if at.lower() in r["matched_title"].lower() or r["matched_title"].lower() in at.lower():
-                anchors.append(r)
-                break
-    if not anchors:
-        # fall back: search the catalog directly for these titles
-        for at in anchor_titles:
-            mask = df["title"].str.contains(at, case=False, na=False, regex=False)
-            if mask.any():
-                row = df[mask].nlargest(1, "ratings_count").iloc[0]
-                anchors.append({"matched_title": row["title"],
-                                "matched_author": row["primary_author"],
-                                "corpus_index": int(df.index[df["book_id"] == row["book_id"]][0]),
-                                "book_id": row["book_id"], "rating": 5.0})
-    if not anchors:
-        return {"recommendations": [], "note": f"Could not find any of {anchor_titles} to anchor on."}
+    filtered = min_year is not None or max_year is not None or bool(avoid_tags)
+    recs, top = sr.rank(b, ratings, state.get("skipped"),
+                        n=80 if filtered else None, anchor_positions=anchors)
+    rows, avoided = [], []
+    for _, rec in recs.iterrows():
+        if not sr.year_ok(rec.get("year"), min_year, max_year):
+            continue
+        why = sr.avoid_reason(b, rec["corpus_index"], avoid_tags, avoid_cols) if avoid_tags else None
+        if why:
+            avoided.append(f"{rec['title']} ({why})")
+            continue
+        rows.append(_rec_row(b, rec))
+        if len(rows) >= n:
+            break
 
-    rated_ids = {r["book_id"] for r in ratings}
-    rated_authors = {r.get("matched_author", "").lower() for r in ratings}
-
-    anchor_vectors = np.array([embeddings[a["corpus_index"]] for a in anchors]).astype("float32")
-    sims, idxs = index.search(anchor_vectors, 150)
-
-    # round-robin across anchors
-    queues = []
-    for i in range(len(anchors)):
-        q = []
-        for s, ix in zip(sims[i], idxs[i]):
-            if ix < 0:        # FAISS pads with -1 when fewer neighbors than k exist
-                continue
-            b = df.iloc[ix]
-            if b["book_id"] in rated_ids:
-                continue
-            if b["primary_author"].lower() in rated_authors:
-                continue
-            if b["ratings_count"] < 2000:
-                continue
-            yr = b["publication_year"]
-            if min_year is not None and (pd.isna(yr) or yr < min_year):
-                continue
-            if max_year is not None and (pd.isna(yr) or yr > max_year):
-                continue
-            q.append((int(ix), float(s)))
-        queues.append(q)
-
-    results, seen, seen_w = [], set(), set()
-    while len(results) < n:
-        added = 0
-        for qi, q in enumerate(queues):
-            taken = 0
-            while q and taken < 2:
-                ix, s = q.pop(0)
-                b = df.iloc[ix]; w = b["work_id"]
-                if ix in seen or (w and w in seen_w):
-                    continue
-                seen.add(ix)
-                if w: seen_w.add(w)
-                yr = int(b["publication_year"]) if pd.notna(b["publication_year"]) else None
-                results.append({"title": b["title"], "author": b["primary_author"],
-                                "year": yr, "because_of": anchors[qi]["matched_title"]})
-                taken += 1; added += 1
-                if len(results) >= n: break
-            if len(results) >= n: break
-        if added == 0: break
-    return {"recommendations": results}
+    mode = ("anchored on: " + ", ".join(str(b["df"].iloc[p]["title"]) for p in anchors)
+            if anchors else "whole profile (the same list the website's Books tab shows)")
+    out = {"mode": mode, "recommendations": rows}
+    if top is not None and len(top):
+        out["taste_signature"] = [str(t) for t in top.index[:5]]
+    if unresolved:
+        out["unresolved_anchors"] = unresolved
+    if avoided:
+        out["removed_by_avoid_tags"] = len(avoided)
+    if not rows:
+        out["note"] = ("Nothing came back. The ranker needs at least one rating of 4+, "
+                       "or the filters are too narrow.")
+    return out
 
 
 def _tool_search_catalog(state, query, limit=5):
-    df = state["df"]
-    mask = df["title"].str.contains(query, case=False, na=False, regex=False)
-    hits = df[mask].nlargest(limit, "ratings_count")
-    return {"results": [{"title": r["title"], "author": r["primary_author"],
-                         "year": int(r["publication_year"]) if pd.notna(r["publication_year"]) else None}
-                        for _, r in hits.iterrows()]}
+    b = _b(state)
+    hits = b["ns"]["search_books"](query, b["df"], b["search_idx"], limit=int(limit or 5))
+    rated = sr.excluded_positions(b, state["ratings"])
+    return {"results": [dict(_row(b, p), recommendable=bool(b["servable"][p]),
+                             already_rated=int(p) in rated)
+                        for p in hits.index]}
+
 
 def _tool_search_catalog_semantic(state, query, limit=15, min_year=None, max_year=None):
-    """Semantic search across the ENTIRE catalog (not anchored to user ratings).
-    Use when the user asks for a genre/vibe outside their rated taste — combine
-    the requested genre with qualities you've inferred from their taste."""
-    df = state["df"]
-    embeddings = state["embeddings"]
-    index = state["index"]
-    ratings = state["ratings"]
-
-    model = _get_query_embedder(state)
-    qvec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-
-    # search a wider net so we can filter by year/popularity and still have enough
-    sims, idxs = index.search(qvec, 200)
-
-    rated_ids = {r["book_id"] for r in ratings}
-    rated_authors = {r.get("matched_author", "").lower() for r in ratings if r.get("matched_author")}
-
-    results = []
-    seen_works = set()
-    for s, ix in zip(sims[0], idxs[0]):
-        if ix < 0:        # FAISS pads with -1 when fewer neighbors than k exist
+    b, ratings = _b(state), state["ratings"]
+    df = b["df"]
+    q = embed_query(state, query)
+    sims, idxs = b["index"].search(q, 400)
+    skip = sr.excluded_positions(b, ratings, state.get("skipped"))
+    people = sr.rated_people(b, ratings)
+    results, works = [], set()
+    for s, p in zip(sims[0], idxs[0]):
+        p = int(p)
+        if p < 0 or p in skip or not b["servable"][p] or sr.shares_people(b, p, people):
             continue
-        b = df.iloc[ix]
-        if b["book_id"] in rated_ids:
+        row = df.iloc[p]
+        w = row["work_id"] if "work_id" in df.columns else None
+        if sr.has_value(w):
+            if w in works:
+                continue
+            works.add(w)
+        if not sr.year_ok(row.get("publication_year"), min_year, max_year):
             continue
-        if b["primary_author"].lower() in rated_authors:
-            continue
-        if b["ratings_count"] < 2000:
-            continue
-        w = b["work_id"]
-        if w and w in seen_works:
-            continue
-        if w:
-            seen_works.add(w)
-        yr = b["publication_year"]
-        if min_year is not None and (pd.isna(yr) or yr < min_year):
-            continue
-        if max_year is not None and (pd.isna(yr) or yr > max_year):
-            continue
-        results.append({
-            "title": b["title"],
-            "author": b["primary_author"],
-            "year": int(yr) if pd.notna(yr) else None,
-            "genres": list(b["genres"]) if b["genres"] is not None else [],
-            "relevance": round(float(s), 3),
-        })
-        if len(results) >= limit:
+        results.append(dict(_row(b, p), relevance=round(float(s), 3)))
+        if len(results) >= int(limit or 15):
             break
+    return {"query": query, "results": results,
+            "note": "Catalogue-wide results by meaning. Excludes rated books and their authors."}
 
-    return {
-        "query": query,
-        "results": results,
-        "note": "Catalog-wide semantic results. Use these when the user asks for a genre outside their rated taste."
-    }
 
-def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15, min_year=None, max_year=None):
-    """Search by quality-tags across the FULL catalog: LLM tags (~33K books,
-    weight 1.0) + kNN-propagated tags (~397K books, weight 0.5). Propagated
-    tags are inference (holdout precision 0.541), so they rank lower and are
-    marked as inferred in the output."""
-    df = state["df"]
-    ratings = state["ratings"]
-
-    KNN_WEIGHT = 0.5
-
-    if "tags_df" not in state:
-        from pathlib import Path
-        llm_path = Path("data/processed/book_tags.parquet")
-        knn_path = Path("data/processed/book_tags_knn.parquet")
-        if not llm_path.exists():
-            return {"results": [], "note": "No tag data available."}
-        llm = pd.read_parquet(llm_path)
-        llm["source"] = "llm"
-        llm["book_id"] = llm["book_id"].astype(str)
-        if knn_path.exists():
-            knn = pd.read_parquet(knn_path)[["book_id", "tag", "score"]]
-            knn["source"] = "knn"
-            knn["book_id"] = knn["book_id"].astype(str)
-            knn["score"] = knn["score"] * KNN_WEIGHT
-            both = pd.concat([llm, knn], ignore_index=True)
-            # LLM wins on any (book_id, tag) collision. Make the priority
-            # EXPLICIT rather than relying on alphabetical accident:
-            both["_prio"] = (both["source"] == "llm").astype(int)
-            both = (both.sort_values("_prio")
-                        .drop_duplicates(subset=["book_id", "tag"], keep="last")
-                        .drop(columns="_prio"))
-        else:
-            both = llm
-        state["tags_df"] = both.pivot_table(
-            index="book_id", columns="tag", values="score", fill_value=0.0
-        ).astype("float32")
-        # (book_id, tag) -> source, for marking inferred tags in output
-        state["tag_source"] = {(str(b), t): s for b, t, s in
-                               zip(both.book_id, both.tag, both.source)}
-        # book_id -> positional row, so ranked iteration isn't O(n) per lookup
-        state["bookid_pos"] = {str(b): i for i, b in enumerate(df["book_id"])}
-
-    tags_df = state["tags_df"]
-    tag_source = state["tag_source"]
-    bookid_pos = state["bookid_pos"]
-
-    positive_tags = positive_tags or []
-    negative_tags = negative_tags or []
-    available = set(tags_df.columns)
-    pos = [t for t in positive_tags if t in available]
-    neg = [t for t in negative_tags if t in available]
-    invalid = [t for t in positive_tags + negative_tags if t not in available]
-
+def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15,
+                         min_year=None, max_year=None):
+    b = _b(state)
+    if b["tags"] is None:
+        return {"results": [], "note": "No tag file is loaded."}
+    pos, bad1, s1 = sr.resolve_tags(b, positive_tags)
+    neg, bad2, s2 = sr.resolve_tags(b, negative_tags)
     if not pos and not neg:
-        return {"results": [], "note": f"None of those tags exist. Available tags include: {sorted(available)[:30]}..."}
+        return {"results": [], "invalid_tags": bad1 + bad2, "suggestions": {**s1, **s2},
+                "common_tags": sr.common_tags(b),
+                "note": "None of those tags exist. Retry with tags from suggestions or common_tags."}
+    df, people = b["df"], sr.rated_people(b, state["ratings"])
 
-    score = tags_df[pos].sum(axis=1) if pos else pd.Series(0.0, index=tags_df.index)
-    if neg:
-        score = score - tags_df[neg].sum(axis=1)
+    def keep(p):
+        return (not sr.shares_people(b, p, people)
+                and sr.year_ok(df.iloc[p].get("publication_year"), min_year, max_year))
 
-    rated_ids = {str(r["book_id"]) for r in ratings}
-    rated_authors = {r.get("matched_author", "").lower() for r in ratings if r.get("matched_author")}
-    ranked = score.sort_values(ascending=False)
-
-    results = []
-    for book_id, s in ranked.items():
-        if s <= 0:
-            break                      # scores only fall from here; nothing left
-        if str(book_id) in rated_ids:
-            continue
-        pos_ix = bookid_pos.get(str(book_id))
-        if pos_ix is None:
-            continue
-        b = df.iloc[pos_ix]
-        if b["primary_author"].lower() in rated_authors:
-            continue
-        if b["ratings_count"] < 2000:
-            continue
-        yr = b["publication_year"]
-        if min_year is not None and (pd.isna(yr) or yr < min_year):
-            continue
-        if max_year is not None and (pd.isna(yr) or yr > max_year):
-            continue
-
-        book_tags = tags_df.loc[book_id].nlargest(5)
-        top_tags = [(t + (" (inferred)" if tag_source.get((str(book_id), t)) == "knn" else ""),
-                     round(float(v), 2))
-                    for t, v in book_tags.items() if v > 0]
-
-        results.append({
-            "title": b["title"],
-            "author": b["primary_author"],
-            "year": int(yr) if pd.notna(yr) else None,
-            "tag_score": round(float(s), 2),
-            "top_tags": top_tags,
-        })
-        if len(results) >= limit:
-            break
-
-    return {
-        "positive_tags_used": pos,
-        "negative_tags_used": neg,
-        "invalid_tags": invalid,
-        "results": results,
-        "note": (f"Searched {len(tags_df):,} tagged books (near-full catalog). "
-                 "Tags marked (inferred) come from embedding-neighbour propagation "
-                 "and are less certain than unmarked LLM-assigned tags."),
-    }
+    hits = sr.tag_search(b, pos, neg, sr.excluded_positions(b, state["ratings"], state.get("skipped")),
+                         keep=keep, limit=int(limit or 15))
+    return {"positive_tags_used": pos, "negative_tags_used": neg,
+            "invalid_tags": bad1 + bad2, "suggestions": {**s1, **s2},
+            "results": [dict(_row(b, p), tag_score=round(s, 2), top_tags=t) for p, s, t in hits],
+            "note": f"Searched {len(b['tags']):,} tagged books (Hardcover reader tags)."}
 
 
-# tool schemas exposed to Claude
+# ---------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------
 TOOLS = [
     {
-        "name": "search_user_ratings",
-        "description": "Look at the books the user has rated. If you provide a query describing a vibe/genre/mood (e.g. 'noir crime', 'funny', 'literary fiction'), it returns the user's rated books ranked by SEMANTIC similarity to that query — so it finds books by meaning, not keyword. Omit the query to get all ratings. Use this to find which of the user's books match a description like 'my noir books'.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Optional vibe/genre/mood text, e.g. 'crime noir' or 'funny'. Omit to get all ratings."}
-            },
-        },
+        "name": "get_recommendations",
+        "description": (
+            "The website's own book recommender. With NO anchor_titles it returns exactly the "
+            "list the website's Books tab shows for this user's whole profile: use it for open "
+            "requests like 'what should I read next'. With anchor_titles it steers the same "
+            "ranker toward those books; the user's other likes still count as read and their "
+            "dislikes still apply. Each pick carries because_of / also_because (the rated books "
+            "it is closest to), matched_tags (reader tags that lifted it), form (novel, memoir, "
+            "reportage...) and a blurb. Optional publication-year filters, and avoid_tags to "
+            "drop anything strongly tagged or shelved as e.g. 'romance' or 'horror'. Start "
+            "here for any 'for me' request, putting the user's exclusions in avoid_tags."),
+        "input_schema": {"type": "object", "properties": {
+            "anchor_titles": {"type": "array", "items": {"type": "string"},
+                              "description": "Optional. Books to steer toward: rated books or any catalogue title."},
+            "n": {"type": "integer", "description": "How many to return, up to 20 (default 10)."},
+            "min_year": {"type": "integer"},
+            "max_year": {"type": "integer"},
+            "avoid_tags": {"type": "array", "items": {"type": "string"},
+                           "description": "Things the user doesn't want, e.g. ['romance']."}}},
     },
     {
-        "name": "get_recommendations",
-        "description": "Get book recommendations based on a set of anchor books (titles the user likes). Optionally restrict by publication year. Returns unread books similar to the anchors, each tagged with which anchor it came from.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "anchor_titles": {"type": "array", "items": {"type": "string"},
-                                  "description": "Titles to base recommendations on. Can be the user's rated books or any book."},
-                "n": {"type": "integer", "description": "How many recommendations to return (default 10)."},
-                "min_year": {"type": "integer", "description": "Optional: only books published in or after this year."},
-                "max_year": {"type": "integer", "description": "Optional: only books published in or before this year."},
-            },
-            "required": ["anchor_titles"],
-        },
+        "name": "search_user_ratings",
+        "description": (
+            "The books the user has rated. With a query describing a vibe or genre ('noir crime', "
+            "'funny', 'literary fiction'), returns their rated books ranked by similarity in "
+            "meaning. Omit the query for all ratings, highest first."),
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Optional vibe/genre/mood text."}}},
     },
     {
         "name": "search_catalog",
-        "description": "Check whether a book exists in the catalog and get its details. Use to verify a title before anchoring on it.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Title to search for."},
-                "limit": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
+        "description": (
+            "Look a book up by title or author. Says whether it is recommendable (clears the "
+            "website's quality floor) and whether the user already rated it. Use it to verify a "
+            "title before naming or anchoring on it."),
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["query"]},
     },
     {
         "name": "search_catalog_semantic",
-        "description": "Semantic search across the ENTIRE catalog by free-text query (genre + qualities). Use this when the user asks for a genre they haven't rated in (e.g. they ask for cyberpunk but their ratings are all literary fiction). The right pattern: first look at their ratings to infer qualities they enjoy (twists, character-driven, witty, fast-paced, etc.), then call this with a query combining the requested genre AND those qualities — e.g. 'cyberpunk with literary depth and character focus'. Excludes books they've rated and authors they've read.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Free-text query combining the requested genre with qualities from the user's taste. e.g. 'cyberpunk with twists and witty dialogue'."},
-                "limit": {"type": "integer", "description": "How many results to return (default 15)."},
-                "min_year": {"type": "integer"},
-                "max_year": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
+        "description": (
+            "Search the whole catalogue by meaning with a free-text query. Use for requests "
+            "outside the user's rated taste: combine the requested genre with qualities they "
+            "reliably enjoy, e.g. 'cyberpunk with literary depth and character focus'. Excludes "
+            "rated books and their authors."),
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string"}, "limit": {"type": "integer"},
+            "min_year": {"type": "integer"}, "max_year": {"type": "integer"}},
+            "required": ["query"]},
     },
     {
         "name": "search_by_tags",
-        "description": "Search books by quality-tags (NOT genres). Covers nearly the FULL catalog: ~33K popular books carry high-confidence LLM-assigned tags, and ~397K more carry inferred tags propagated from embedding neighbours (marked '(inferred)' in results, ranked lower). Use when the user asks for specific qualities like 'books with unreliable narrators,' 'slow-burn dark academia,' 'fast-paced sci-fi without romance,' etc. Available tags include pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical), narrator (unreliable-narrator, first-person, multiple-povs), structure (non-linear, epistolary, dual-timeline), style (literary-prose, witty, lyrical, satire), themes (coming-of-age, grief, identity, found-family, legacy, hubris), experience (page-turner, thought-provoking, mind-bending, comfort-read), and genres (high-fantasy, urban-fantasy, dark-academia, science-fiction, cyberpunk, dystopian, space-opera, climate-fiction, time-travel). Returns books with each book's top contributing tags for explanation. Inferred tags are reliable for broad qualities (dark, romance, thriller, psychological) and weak for rare structural ones (epistolary, second-person, time-loop) — for those, results will skew to the LLM-tagged subset, which is correct.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "positive_tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Tags the book SHOULD score high on."
-                },
-                "negative_tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Tags the book should score LOW on (for excluding qualities)."
-                },
-                "limit": {"type": "integer"},
-                "min_year": {"type": "integer"},
-                "max_year": {"type": "integer"},
-            },
-        },
+        "description": (
+            "Search books by Hardcover reader tags: genres and moods applied by readers, on "
+            "about 86% of the catalogue. Good for genre-plus-mood requests ('dark mystery', "
+            "'funny fantasy, not romance'). Moods like funny, emotional and adventurous sit on "
+            "most books and say little alone; pair them with something specific. If a tag "
+            "doesn't exist, the result lists real tags to retry with."),
+        "input_schema": {"type": "object", "properties": {
+            "positive_tags": {"type": "array", "items": {"type": "string"}},
+            "negative_tags": {"type": "array", "items": {"type": "string"}},
+            "limit": {"type": "integer"},
+            "min_year": {"type": "integer"}, "max_year": {"type": "integer"}}},
     },
 ]
 
 TOOL_IMPLS = {
-    "search_user_ratings": _tool_search_user_ratings,
     "get_recommendations": _tool_get_recommendations,
+    "search_user_ratings": _tool_search_user_ratings,
     "search_catalog": _tool_search_catalog,
     "search_catalog_semantic": _tool_search_catalog_semantic,
-    "search_by_tags": _tool_search_by_tags
+    "search_by_tags": _tool_search_by_tags,
 }
 
-SYSTEM_PROMPT = """You are a thoughtful book recommendation assistant. You help the user find books to read based on their taste and their requests.
+SYSTEM_PROMPT = """You are a thoughtful book recommendation assistant. You help the user find books to read, based on their ratings and their request.
 
-You are strictly a book recommendation assistant. If the user asks for anything unrelated to books or reading (general questions, code, advice on other topics), politely redirect them: "I'm focused on book recommendations — what kind of book are you in the mood for?"
-You have five tools:
-- search_user_ratings: inspect what the user has rated, with optional semantic query
-- get_recommendations: find books similar to anchor books they've rated (best when their taste matches the request)
-- search_catalog: look up a specific title
-- search_catalog_semantic: search the WHOLE catalog by free-text (genre + qualities), use when the user asks for something outside their rated taste
-- search_by_tags: search by quality-tags across nearly the full catalog
+You only do book recommendations. If asked about anything else, say: "I'm focused on book recommendations — what kind of book are you in the mood for?"
 
-Decide which path the request needs:
+Choose a path:
 
-**Path A — request fits their taste** (e.g. "more like my noir books", "something recent like the literary fiction I enjoy"):
-1. search_user_ratings WITH a query to find which rated books fit the description.
-2. get_recommendations with those matched books as anchors.
-3. Explain why each pick fits.
+**Open request** ("what should I read next?", "a must-read list for me", "surprise me"): get_recommendations with no anchors. That is the website's own list for their profile. Put anything they rule out ("no romance") in avoid_tags. Only add catalogue or tag searches if that list is too thin, and say which picks came from the wider search.
 
-**Path B — request is OUTSIDE their rated taste** (e.g. they ask for cyberpunk/horror/romance but their ratings are mostly literary fiction):
-1. search_user_ratings WITHOUT a query to see the full taste picture.
-2. Identify 2-3 qualities the user reliably enjoys (twists, character-driven, witty, fast-paced, dark humor, immersive worldbuilding, literary prose, etc.). Reference specific books they've rated highly.
-3. Call search_catalog_semantic with a query that combines the requested genre + those qualities. e.g. "cyberpunk character-driven with literary depth" or "western with dark humor and twists".
-4. Present the picks by EXPLICITLY BRIDGING: "You rated [book] highly for [quality] — here's a cyberpunk novel with that same [quality]." This is the value-add: don't just dump genre results, show the user why these specific picks fit them.
+**Path A — fits their taste** ("more like my noir books"): search_user_ratings with a query to find the matching rated books, then get_recommendations with those as anchor_titles.
 
-**Path C — request is QUALITY-based** (e.g. "unreliable narrators," "slow-burn dark academia," "books with twists set in space"):
-1. Use search_by_tags with positive_tags listing the qualities, optionally negative_tags for things to avoid.
-2. Cross-reference with the user's taste — note which returned books have tags that overlap with what they've rated highly.
-3. Explain the picks by referencing the specific tags ("This scores high on unreliable-narrator and atmospheric, both qualities you rated highly in X").
-4. Tag search now covers nearly the full catalog. Unmarked tags are high-confidence; tags marked (inferred) are propagated and less certain — when a pick rests mainly on inferred tags, soften the claim ("this looks like a slow-burn dark academia pick") rather than asserting it. If results are weak, fall back to search_catalog_semantic.
+**Path B — outside their taste** ("I want cyberpunk" from someone who reads literary fiction): search_user_ratings without a query, pick 2-3 qualities they reliably enjoy (name the books), then search_catalog_semantic combining the genre with those qualities. Bridge explicitly: "You rated X highly for its Y; this has the same Y."
 
-You can also COMBINE paths: for "cyberpunk with witty dialogue," call search_by_tags with positive=[cyberpunk, witty, dialogue-heavy], then explain bridges to the user's taste.
+**Path C — tag request** ("dark mystery", "funny fantasy without romance"): search_by_tags. If results are thin, fall back to search_catalog_semantic.
 
-CRITICAL — GROUNDING RULE (read carefully):
-Every single book you name in a recommendation MUST appear, by title, in a tool result you received in THIS conversation. This is an absolute rule:
-- Do NOT add books from your own knowledge, even if they fit the request perfectly and you are confident they exist. If a great book comes to mind but it is not in your tool results, you may NOT name it — instead, run another tool search to try to surface it.
-- Never recommend books the user has already rated (visible via search_user_ratings — those are books they've read).
-- If your tool results don't contain enough good matches, say so honestly and offer to search differently, rather than padding the list with books from memory.
-- Prefer the EXACT titles as they appear in the tool results. Do not rename, retranslate, or "correct" them.
-- When in doubt about whether a book is in the catalog, call search_catalog to verify before naming it.
-The recommender's entire value is that it is grounded in this specific catalog and the user's actual ratings. A recommendation the tools didn't return is worse than no recommendation — it breaks trust and may point to a book that isn't in the catalog at all.
+Fiction or non-fiction: results carry a form field (novel, memoir, reportage, history...). If the user asks for non-fiction, don't offer novels, and the reverse.
 
-When a user asks for "something to read" (short, long, fun, dark, etc.) without specifying genre, treat it as Path B — use their ratings to infer qualities, then search_catalog_semantic for fresh unread books matching those qualities + the constraint they gave.
+EXPLAINING PICKS: for get_recommendations results, the reasons are because_of, also_because and matched_tags; those are why the ranker chose the book. For search results, explain by the query or tags that found it. Describe a book only from its blurb, genres and tags. If a result has no blurb, don't summarise its plot from your own knowledge, even if you know the book well.
 
-Other guidance:
-- For mood shifts ("lighter", "darker", "faster-paced") that the tools can't filter directly, use judgment to pick from results and explain.
-- Be concise and warm. Reference the user's taste in your explanations.
-- If recommendations would be weak, say so honestly rather than forcing them.
-- The catalog is books only (no film/TV), up to 2025."""
+GROUNDING RULE — absolute:
+- Every book you name must appear, by title, in a tool result from THIS conversation. Never add a book from your own knowledge, however sure you are; run another search instead.
+- Never recommend a book the user has already rated.
+- Use titles exactly as the tools returned them.
+- Write each recommended book as **Title** (Author, Year), using the tool's values.
+- If the results are weak, say so and offer to search differently rather than padding the list.
+
+Be concise and warm, and refer to the user's own books when explaining."""
 
 
-def _titles_from_result(result):
-    """Pull every book title out of a tool result dict (any tool's shape)."""
-    titles = set()
-    if not isinstance(result, dict):
-        return titles
-    for key in ("recommendations", "results", "matched_books", "ratings"):
-        items = result.get(key)
-        if isinstance(items, list):
-            for it in items:
-                if isinstance(it, dict) and it.get("title"):
-                    titles.add(it["title"])
-    return titles
-
-
-def _check_faithfulness(reply, seen_titles):
-    """Find book titles in the reply that were never returned by any tool.
-
-    Precision matters: we only treat a phrase as a *title* if it is shaped like
-    one — immediately followed by a parenthetical containing a 4-digit year
-    and/or an author, e.g. "Piranesi (Susanna Clarke, 2020)" or "Dune (1965)".
-    This avoids flagging prose fragments that a looser bold/numbered-list scan
-    would wrongly catch. Returns a list of suspicious (likely-hallucinated) titles.
-    """
-    import re
-
-    pattern = re.compile(
-        r"(?:\*\*)?"                       # optional opening bold
-        r"([A-Z0-9][^\n*()]{1,70}?)"       # the title text (starts capitalized)
-        r"(?:\*\*)?"                       # optional closing bold
-        r"\s*\((?:[^)]*?\b(?:19|20)\d{2}\b[^)]*)\)"  # ( ... yyyy ... )
-    )
-    cands = [m.group(1).strip().rstrip(":–-—").strip() for m in pattern.finditer(reply)]
-    cands = [re.sub(r"^\d+\.\s*", "", c).strip() for c in cands]
-
-    def norm(s):
-        return "".join(ch for ch in s.lower() if ch.isalnum())
-
-    seen_norm = {norm(t) for t in seen_titles}
-    suspicious, suspicious_norms = [], set()
-    for c in cands:
-        cn = norm(c)
-        if len(cn) < 3 or cn in suspicious_norms:
-            continue
-        if cn in seen_norm:
-            continue
-        if any(cn in s or s in cn for s in seen_norm if len(s) >= 4):
-            continue
-        suspicious.append(c)
-        suspicious_norms.add(cn)
-    return suspicious
-
-
-def run_agent(user_message, state, conversation_history=None, max_turns=6, verbose=True):
-    """Run the agentic loop. Returns (final_text, updated_history).
-
-    Tracks every title returned by tools and, after the model's final answer,
-    checks whether the answer names any book the tools never returned (a sign of
-    the model freelancing from memory). When verbose, prints returned titles and
-    any suspicious (likely-hallucinated) ones.
-    """
-    client = Anthropic()
-    history = conversation_history or []
-    history = history + [{"role": "user", "content": user_message}]
-
-    # Conversation-scoped, not turn-scoped. The grounding rule says "in THIS
-    # conversation", and a follow-up like "tell me about the third one" makes
-    # no tool calls -- with a per-turn reset it flagged the answer as a
-    # hallucination. Lives on `state` so it survives across messages.
-    seen_titles = state.setdefault("_seen_titles", set())
-
-    for turn in range(max_turns):
-        resp = client.messages.create(
-            model=MODEL, max_tokens=1500, system=SYSTEM_PROMPT,
-            tools=TOOLS, messages=history,
-        )
-
-        tool_calls = [b for b in resp.content if b.type == "tool_use"]
-        text_blocks = [b.text for b in resp.content if b.type == "text"]
-
-        history.append({"role": "assistant", "content": resp.content})
-
-        if not tool_calls:
-            reply = "\n".join(text_blocks)
-            suspicious = _check_faithfulness(reply, seen_titles)
-            if verbose and suspicious:
-                print(f"  [!] WARNING: {len(suspicious)} title(s) in the reply were "
-                      f"NOT in any tool result (possible hallucination):")
-                for s in suspicious:
-                    print(f"        - {s}")
-            elif verbose:
-                print(f"  [ok] all recommended titles were grounded in tool results "
-                      f"({len(seen_titles)} books seen across tools)")
-            return reply, history
-
-        tool_results = []
-        for tc in tool_calls:
-            impl = TOOL_IMPLS.get(tc.name)
-            try:
-                result = impl(state, **tc.input)
-            except Exception as e:
-                result = {"error": str(e)}
-            returned = _titles_from_result(result)
-            seen_titles |= returned
-            if verbose:
-                print(f"  [agent calls {tc.name}({json.dumps(tc.input)})]")
-                if returned:
-                    preview = list(returned)[:8]
-                    more = f" (+{len(returned) - 8} more)" if len(returned) > 8 else ""
-                    print(f"        -> returned {len(returned)} books: {', '.join(preview)}{more}")
-                else:
-                    print(f"        -> (no book titles in result)")
-            tool_results.append({
-                "type": "tool_result", "tool_use_id": tc.id,
-                "content": json.dumps(result),
-            })
-        history.append({"role": "user", "content": tool_results})
-
-    return "(agent hit max turns without finishing)", history
+def run_agent(user_message, state, conversation_history=None, max_turns=8, verbose=True):
+    """Returns (reply, history). The grounding result is left in state["_last_check"]."""
+    return run_agent_loop(user_message, state, system=SYSTEM_PROMPT, tools=TOOLS,
+                          impls=TOOL_IMPLS, noun="books",
+                          conversation_history=conversation_history,
+                          max_turns=max_turns, verbose=verbose)

@@ -1,513 +1,360 @@
 """
-Movie recommendation agent — multi-step reasoning over the movie recommender.
+Film recommendation agent -- Claude (Haiku) with tools over the film catalogue.
 
-Mirrors the books agent (src/agent.py) structure exactly: Claude (Haiku) is
-given tools wrapping the movie recommender and runs an agentic loop. UI-agnostic:
-takes the loaded corpus/embeddings/index + user ratings, exposes run_agent(...).
+Ranking is NOT implemented here. get_recommendations calls the Space's own
+recommend_movies through space_ranker, with the arguments the Movies tab
+passes, so with no anchors the agent's list IS the website's "For you" list
+(kids filter, runtime floor, quality floor, tag layer and all). The other
+tools are searches that apply the same floors.
 
-Mirrors books, with movie-schema adaptations:
-  book_id -> id, primary_author -> director, ratings_count -> vote_count,
-  publication_year -> release_year, work_id -> (none), book_tags -> movie_tags.
-
-ADDS movie-only tools enabled by the richer IMDb data:
-  - search_by_people : films by a director OR actor (auteur / star following)
-  - search_by_studio : films from a studio (A24, Blumhouse, Ghibli, ...)
-  and a `language` filter on semantic search (e.g. Korean / Hindi cinema).
+Movie-only tools: search_by_people (director or actor) and search_by_studio,
+plus a language filter on recommendations and semantic search.
 
 Set key:  $env:ANTHROPIC_API_KEY = "sk-ant-..."
 """
-import json
-from pathlib import Path
 import numpy as np
 import pandas as pd
-from anthropic import Anthropic
 
-MODEL = "claude-haiku-4-5-20251001"
+import space_ranker as sr
+from agent_common import embed_query, run_agent_loop
 
-MIN_VOTES = 400  # popularity floor, matches the app
-
-# language display <-> code helpers (small, common subset)
-LANG_NAMES = {
-    "en": "English", "fr": "French", "es": "Spanish", "ja": "Japanese",
-    "it": "Italian", "de": "German", "ru": "Russian", "zh": "Chinese",
-    "pt": "Portuguese", "ko": "Korean", "hi": "Hindi", "ta": "Tamil",
-    "te": "Telugu", "ml": "Malayalam", "th": "Thai", "fa": "Persian",
-    "sv": "Swedish", "da": "Danish", "nl": "Dutch", "pl": "Polish",
-}
-NAME_TO_CODE = {v.lower(): k for k, v in LANG_NAMES.items()}
+KIND = "movie"
 
 
-def _lang_code(name_or_code):
-    """Accept 'Korean' or 'ko' -> 'ko'. Returns None if unrecognized."""
+def _b(state):
+    return state["bundle"]
+
+
+def _lang_code(b, name_or_code):
+    """'Korean' or 'ko' -> 'ko', using the Space's own language table."""
     if not name_or_code:
         return None
+    names = b["ns"].get("LANG_NAMES", {})
     s = str(name_or_code).strip().lower()
-    if s in LANG_NAMES:
+    if s in names:
         return s
-    return NAME_TO_CODE.get(s)
+    return {v.lower(): k for k, v in names.items()}.get(s)
+
+
+def _row(b, pos):
+    r = b["df"].iloc[int(pos)]
+    out = {"title": str(r["title"]), "director": sr.text(r.get("director")),
+           "year": sr.year_of(r.get("release_year")),
+           "language": b["ns"]["lang_label"](r.get("original_language")),
+           "genres": sr.split_genres(r.get("genres"))[:3]}
+    blurb = sr.short(r.get("overview"), 160)
+    if blurb:
+        out["blurb"] = blurb
+    return out
+
+
+def _rec_row(rec):
+    out = {"title": str(rec["title"]), "director": sr.text(rec.get("director")),
+           "cast": [str(c) for c in sr.as_list(rec.get("cast"))[:3]],
+           "year": sr.year_of(rec.get("year")), "language": sr.text(rec.get("language")),
+           "genres": sr.split_genres(rec.get("genres"))[:3],
+           "vote_average": rec.get("vote_average"),
+           "because_of": rec.get("because_of")}
+    also = rec.get("also_because")
+    if isinstance(also, str) and also:
+        out["also_because"] = also
+    tags = [t for t in sr.as_list(rec.get("match_tags")) if t]
+    if tags:
+        out["matched_tags"] = tags
+    blurb = sr.short(rec.get("overview"))
+    if blurb:
+        out["blurb"] = blurb
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Tool implementations — wrap the real movie recommender logic.
+# Tools
 # ---------------------------------------------------------------------------
-
-def _get_query_embedder(state):
-    """Lazy-load and cache the embedding model on state for query encoding."""
-    if "query_embedder" not in state:
-        from sentence_transformers import SentenceTransformer
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = SentenceTransformer("BAAI/bge-m3", device=device)
-        state["query_embedder"] = model
-    return state["query_embedder"]
-
-
 def _tool_search_user_ratings(state, query=None, top_k=8):
-    """Return the user's rated films. With a query, rank them by SEMANTIC
-    similarity (so 'my heist films' finds them by meaning)."""
     ratings = state["ratings"]
     if not ratings:
-        return {"ratings": [], "note": "User has not rated any films yet."}
-
+        return {"ratings": [], "note": "The user has not rated any films yet."}
     if not query:
-        return {"ratings": [{"title": r["matched_title"],
-                             "director": r.get("matched_director", ""),
-                             "rating": r["rating"]} for r in ratings],
+        return {"ratings": [{"title": r["matched_title"], "director": r.get("matched_director", ""),
+                             "rating": r["rating"]}
+                            for r in sorted(ratings, key=lambda r: -r["rating"])],
                 "count": len(ratings)}
-
-    embeddings = state["embeddings"]
-    model = _get_query_embedder(state)
-    qvec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True)[0]
-
-    scored = []
-    for r in ratings:
-        fvec = embeddings[r["corpus_index"]]
-        sim = float(np.dot(qvec, fvec))
-        scored.append((sim, r))
-    scored.sort(key=lambda x: -x[0])
-
-    top = scored[:top_k]
-    return {
-        "query": query,
-        "matched_films": [
-            {"title": r["matched_title"], "director": r.get("matched_director", ""),
-             "rating": r["rating"], "relevance": round(sim, 3)}
-            for sim, r in top
-        ],
-        "note": "Ranked by semantic similarity to the query.",
-    }
+    b = _b(state)
+    q = embed_query(state, query)[0]
+    scored = sorted(((float(np.dot(q, b["emb"][r["corpus_index"]])), r) for r in ratings),
+                    key=lambda x: -x[0])
+    return {"query": query,
+            "ratings": [{"title": r["matched_title"], "director": r.get("matched_director", ""),
+                         "rating": r["rating"], "relevance": round(s, 3)}
+                        for s, r in scored[:int(top_k or 8)]],
+            "note": "The user's rated films, ranked by similarity in meaning to the query."}
 
 
-def _resolve_anchor(state, title):
-    """Find a film by title: first in user ratings, then in catalog."""
-    df = state["df"]
-    ratings = state["ratings"]
-    for r in ratings:
-        if title.lower() in r["matched_title"].lower() or r["matched_title"].lower() in title.lower():
-            return r
-    mask = df["title"].str.contains(title, case=False, na=False, regex=False)
-    if mask.any():
-        row = df[mask].nlargest(1, "vote_count").iloc[0]
-        pos = int(df.index[df["id"] == row["id"]][0])
-        return {"matched_title": row["title"],
-                "matched_director": row["director"] if "director" in df.columns and isinstance(row["director"], str) else "",
-                "corpus_index": pos, "movie_id": row["id"], "rating": 5.0}
-    return None
+def _tool_get_recommendations(state, anchor_titles=None, n=10, min_year=None, max_year=None,
+                              language=None, avoid_tags=None):
+    b, ratings = _b(state), state["ratings"]
+    avoid_cols = sr.resolve_tags(b, avoid_tags)[0] if b["tags"] is not None else []
+    n = max(1, min(int(n or 10), 20))
+    lang = _lang_code(b, language)
+    if language and lang is None:
+        return {"recommendations": [], "note": f"Unknown language '{language}'."}
+    anchors, unresolved = [], []
+    for t in anchor_titles or []:
+        p = sr.resolve_title(b, t, ratings)
+        if p is None:
+            unresolved.append(t)
+        elif p not in anchors:
+            anchors.append(p)
+    if anchor_titles and not anchors:
+        return {"recommendations": [],
+                "note": f"None of {anchor_titles} are in the catalogue, so there is nothing to anchor on."}
 
+    filtered = (min_year is not None or max_year is not None or lang is not None
+                or bool(avoid_tags))
+    recs, top = sr.rank(b, ratings, state.get("skipped"),
+                        n=80 if filtered else None, anchor_positions=anchors)
+    want_lang = b["ns"]["lang_label"](lang) if lang else None
+    rows, avoided = [], []
+    for _, rec in recs.iterrows():
+        if not sr.year_ok(rec.get("year"), min_year, max_year):
+            continue
+        if want_lang and rec.get("language") != want_lang:
+            continue
+        why = sr.avoid_reason(b, rec["corpus_index"], avoid_tags, avoid_cols) if avoid_tags else None
+        if why:
+            avoided.append(f"{rec['title']} ({why})")
+            continue
+        rows.append(_rec_row(rec))
+        if len(rows) >= n:
+            break
 
-def _tool_get_recommendations(state, anchor_titles, n=10, min_year=None, max_year=None,
-                              language=None):
-    """Core recommender. Finds anchor films (rated or catalog), returns nearest
-    unseen films, with optional year + language filters and director-exclusion."""
-    df = state["df"]; embeddings = state["embeddings"]; index = state["index"]
-    ratings = state["ratings"]
-
-    anchors = [a for a in (_resolve_anchor(state, t) for t in anchor_titles) if a]
-    if not anchors:
-        return {"recommendations": [], "note": f"Could not find any of {anchor_titles} to anchor on."}
-
-    lang = _lang_code(language)
-    rated_ids = {str(r["movie_id"]) for r in ratings}
-    rated_directors = {r.get("matched_director", "").lower() for r in ratings if r.get("matched_director")}
-    has_director = "director" in df.columns
-
-    anchor_vectors = np.array([embeddings[a["corpus_index"]] for a in anchors]).astype("float32")
-    sims, idxs = index.search(anchor_vectors, 200)
-
-    queues = []
-    for i in range(len(anchors)):
-        q = []
-        for s, ix in zip(sims[i], idxs[i]):
-            if ix < 0:        # FAISS pads with -1 when fewer neighbors than k exist
-                continue
-            f = df.iloc[ix]
-            if str(f["id"]) in rated_ids:
-                continue
-            if int(f["vote_count"]) < MIN_VOTES:
-                continue
-            if (has_director and isinstance(f["director"], str) and f["director"]
-                    and f["director"].lower() in rated_directors):
-                continue
-            yr = f["release_year"]
-            if min_year is not None and (pd.isna(yr) or yr < min_year):
-                continue
-            if max_year is not None and (pd.isna(yr) or yr > max_year):
-                continue
-            if lang is not None and f["original_language"] != lang:
-                continue
-            q.append((int(ix), float(s)))
-        queues.append(q)
-
-    results, seen = [], set()
-    while len(results) < n:
-        added = 0
-        for qi, q in enumerate(queues):
-            taken = 0
-            while q and taken < 2:
-                ix, s = q.pop(0)
-                if ix in seen:
-                    continue
-                seen.add(ix)
-                f = df.iloc[ix]
-                yr = int(f["release_year"]) if pd.notna(f["release_year"]) else None
-                results.append({
-                    "title": f["title"],
-                    "director": f["director"] if has_director and isinstance(f["director"], str) else "",
-                    "cast": list(f["cast"])[:4] if "cast" in df.columns and f["cast"] is not None else [],
-                    "year": yr,
-                    "language": LANG_NAMES.get(f["original_language"], f["original_language"]),
-                    "because_of": anchors[qi]["matched_title"],
-                })
-                taken += 1; added += 1
-                if len(results) >= n: break
-            if len(results) >= n: break
-        if added == 0: break
-    return {"recommendations": results}
+    mode = ("anchored on: " + ", ".join(str(b["df"].iloc[p]["title"]) for p in anchors)
+            if anchors else "whole profile (the same list the website's Movies tab shows)")
+    out = {"mode": mode, "recommendations": rows}
+    if top is not None and len(top):
+        out["taste_signature"] = [str(t) for t in top.index[:5]]
+    if unresolved:
+        out["unresolved_anchors"] = unresolved
+    if avoided:
+        out["removed_by_avoid_tags"] = len(avoided)
+    if not rows:
+        note = "Nothing came back."
+        if filtered:
+            note += (" The filters removed everything from the ranked list; for a language "
+                     "request try search_catalog_semantic with the language set.")
+        out["note"] = note
+    return out
 
 
 def _tool_search_catalog(state, query, limit=5):
-    df = state["df"]
-    mask = df["title"].str.contains(query, case=False, na=False, regex=False)
-    hits = df[mask].nlargest(limit, "vote_count")
-    has_director = "director" in df.columns
-    return {"results": [{"title": r["title"],
-                         "director": r["director"] if has_director and isinstance(r["director"], str) else "",
-                         "year": int(r["release_year"]) if pd.notna(r["release_year"]) else None}
-                        for _, r in hits.iterrows()]}
+    b = _b(state)
+    hits = b["ns"]["search_movies"](query, b["df"], b["search_idx"], limit=int(limit or 5))
+    rated = sr.excluded_positions(b, state["ratings"])
+    return {"results": [dict(_row(b, p), recommendable=bool(b["servable"][p]),
+                             already_rated=int(p) in rated)
+                        for p in hits.index]}
 
 
 def _tool_search_catalog_semantic(state, query, limit=15, min_year=None, max_year=None,
                                   language=None):
-    """Semantic search across the ENTIRE catalog. Use for genres/vibes outside
-    the user's rated taste — combine requested genre with qualities you inferred."""
-    df = state["df"]; embeddings = state["embeddings"]; index = state["index"]
-    ratings = state["ratings"]
-
-    model = _get_query_embedder(state)
-    qvec = model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-    sims, idxs = index.search(qvec, 300)
-
-    lang = _lang_code(language)
-    rated_ids = {str(r["movie_id"]) for r in ratings}
-    rated_directors = {r.get("matched_director", "").lower() for r in ratings if r.get("matched_director")}
-    has_director = "director" in df.columns
-
+    b, ratings = _b(state), state["ratings"]
+    df = b["df"]
+    lang = _lang_code(b, language)
+    if language and lang is None:
+        return {"results": [], "note": f"Unknown language '{language}'."}
+    q = embed_query(state, query)
+    sims, idxs = b["index"].search(q, 600 if lang else 400)
+    skip = sr.excluded_positions(b, ratings, state.get("skipped"))
+    people = sr.rated_people(b, ratings)
     results = []
-    for s, ix in zip(sims[0], idxs[0]):
-        if ix < 0:        # FAISS pads with -1 when fewer neighbors than k exist
+    for s, p in zip(sims[0], idxs[0]):
+        p = int(p)
+        if p < 0 or p in skip or not b["servable"][p] or sr.shares_people(b, p, people):
             continue
-        f = df.iloc[ix]
-        if str(f["id"]) in rated_ids:
+        row = df.iloc[p]
+        if lang and row.get("original_language") != lang:
             continue
-        if int(f["vote_count"]) < MIN_VOTES:
+        if not sr.year_ok(row.get("release_year"), min_year, max_year):
             continue
-        if (has_director and isinstance(f["director"], str) and f["director"]
-                and f["director"].lower() in rated_directors):
-            continue
-        yr = f["release_year"]
-        if min_year is not None and (pd.isna(yr) or yr < min_year):
-            continue
-        if max_year is not None and (pd.isna(yr) or yr > max_year):
-            continue
-        if lang is not None and f["original_language"] != lang:
-            continue
-        results.append({
-            "title": f["title"],
-            "director": f["director"] if has_director and isinstance(f["director"], str) else "",
-            "year": int(yr) if pd.notna(yr) else None,
-            "language": LANG_NAMES.get(f["original_language"], f["original_language"]),
-            "genres": [g.strip() for g in f["genres"].split(",")] if isinstance(f["genres"], str) else [],
-            "relevance": round(float(s), 3),
-        })
-        if len(results) >= limit:
+        results.append(dict(_row(b, p), relevance=round(float(s), 3)))
+        if len(results) >= int(limit or 15):
             break
-
     return {"query": query, "results": results,
-            "note": "Catalog-wide semantic results for genres/vibes outside the user's rated taste."}
+            "note": "Catalogue-wide results by meaning. Excludes rated films and rated directors."}
 
 
 def _tool_search_by_tags(state, positive_tags=None, negative_tags=None, limit=15,
                          min_year=None, max_year=None):
-    """Search the tagged subset (~44K films, 40% of catalog) by quality-tags.
-    Source: movie_tags_v2.parquet = genome-derived tags UNION TMDB-keyword tags."""
-    df = state["df"]; ratings = state["ratings"]
-
-    if "tags_df" not in state:
-        tags_path = Path("data/processed/movie_tags_v2.parquet")
-        if not tags_path.exists():
-            return {"results": [], "note": "No tag data available."}
-        tdf = pd.read_parquet(tags_path)
-        tdf["movie_id"] = tdf["movie_id"].astype(str)
-        state["tags_df"] = tdf.pivot_table(
-            index="movie_id", columns="tag", values="score", fill_value=0.0)
-    tags_df = state["tags_df"]
-
-    positive_tags = positive_tags or []
-    negative_tags = negative_tags or []
-    available = set(tags_df.columns)
-    pos = [t for t in positive_tags if t in available]
-    neg = [t for t in negative_tags if t in available]
-    invalid = [t for t in positive_tags + negative_tags if t not in available]
-
+    b = _b(state)
+    if b["tags"] is None:
+        return {"results": [], "note": "No tag file is loaded."}
+    pos, bad1, s1 = sr.resolve_tags(b, positive_tags)
+    neg, bad2, s2 = sr.resolve_tags(b, negative_tags)
     if not pos and not neg:
-        return {"results": [], "note": f"None of those tags exist. Available: {sorted(available)}"}
+        return {"results": [], "invalid_tags": bad1 + bad2, "suggestions": {**s1, **s2},
+                "common_tags": sr.common_tags(b),
+                "note": "None of those tags exist. Retry with tags from suggestions or common_tags."}
+    df, people = b["df"], sr.rated_people(b, state["ratings"])
 
-    score = tags_df[pos].sum(axis=1) if pos else pd.Series(0.0, index=tags_df.index)
-    if neg:
-        score = score - tags_df[neg].sum(axis=1)
+    def keep(p):
+        return (not sr.shares_people(b, p, people)
+                and sr.year_ok(df.iloc[p].get("release_year"), min_year, max_year))
 
-    rated_ids = {str(r["movie_id"]) for r in ratings}
-    rated_directors = {r.get("matched_director", "").lower() for r in ratings if r.get("matched_director")}
-    has_director = "director" in df.columns
-    ranked = score.sort_values(ascending=False)
-
-    results = []
-    for movie_id, s in ranked.items():
-        if str(movie_id) in rated_ids:
-            continue
-        row = df[df["id"].astype(str) == str(movie_id)]
-        if row.empty:
-            continue
-        f = row.iloc[0]
-        if int(f["vote_count"]) < MIN_VOTES:
-            continue
-        if (has_director and isinstance(f["director"], str) and f["director"]
-                and f["director"].lower() in rated_directors):
-            continue
-        yr = f["release_year"]
-        if min_year is not None and (pd.isna(yr) or yr < min_year):
-            continue
-        if max_year is not None and (pd.isna(yr) or yr > max_year):
-            continue
-
-        top_tags = tags_df.loc[movie_id].nlargest(5)
-        top_tags = [(t, round(float(v), 2)) for t, v in top_tags.items() if v > 0]
-        results.append({
-            "title": f["title"],
-            "director": f["director"] if has_director and isinstance(f["director"], str) else "",
-            "year": int(yr) if pd.notna(yr) else None,
-            "tag_score": round(float(s), 2),
-            "top_tags": top_tags,
-        })
-        if len(results) >= limit:
-            break
-
+    hits = sr.tag_search(b, pos, neg, sr.excluded_positions(b, state["ratings"], state.get("skipped")),
+                         keep=keep, limit=int(limit or 15))
     return {"positive_tags_used": pos, "negative_tags_used": neg,
-            "invalid_tags": invalid, "results": results,
-            "note": f"Searched {len(tags_df):,} tagged films (~44K, 40% of catalog: genome + TMDB-keyword tags)."}
+            "invalid_tags": bad1 + bad2, "suggestions": {**s1, **s2},
+            "results": [dict(_row(b, p), tag_score=round(s, 2), top_tags=t) for p, s, t in hits],
+            "note": f"Searched {len(b['tags']):,} tagged films (about 40% of the catalogue)."}
 
 
 def _tool_search_by_people(state, person, role="any", limit=15):
-    """Find films by a DIRECTOR or top-billed ACTOR. role: 'director', 'actor', or 'any'.
-    Excludes films the user already rated."""
-    df = state["df"]; ratings = state["ratings"]
-    rated_ids = {str(r["movie_id"]) for r in ratings}
-    p = person.strip().lower()
-
-    has_director = "director" in df.columns
-    has_cast = "cast" in df.columns
-
-    def director_match(row):
-        return has_director and isinstance(row["director"], str) and p in row["director"].lower()
-
-    def cast_match(row):
-        if not has_cast or row["cast"] is None:
-            return False
-        return any(p in str(a).lower() for a in row["cast"])
-
-    if role == "director":
-        mask = df.apply(director_match, axis=1)
-    elif role == "actor":
-        mask = df.apply(cast_match, axis=1)
-    else:
-        mask = df.apply(lambda r: director_match(r) or cast_match(r), axis=1)
-
-    hits = df[mask].nlargest(limit + len(rated_ids), "vote_count")
+    b = _b(state)
+    df, si = b["df"], b["search_idx"]
+    q = b["ns"]["_normalize"](person or "")
+    if not q:
+        return {"results": [], "note": "Give a name to search for."}
+    d = pd.Series(si["directors"]).str.contains(q, regex=False, na=False).to_numpy()
+    c = pd.Series(si["cast"]).str.contains(q, regex=False, na=False).to_numpy()
+    m = d if role == "director" else c if role == "actor" else (d | c)
+    m = m & b["servable"]
+    skip = sr.excluded_positions(b, state["ratings"], state.get("skipped"))
+    vc = sr._num(df, "vote_count").fillna(0).to_numpy()
+    hits = sorted((int(p) for p in np.flatnonzero(m) if int(p) not in skip), key=lambda p: -vc[p])
     results = []
-    for _, f in hits.iterrows():
-        if str(f["id"]) in rated_ids:
-            continue
-        as_director = director_match(f)
-        results.append({
-            "title": f["title"],
-            "year": int(f["release_year"]) if pd.notna(f["release_year"]) else None,
-            "director": f["director"] if has_director and isinstance(f["director"], str) else "",
-            "cast": list(f["cast"])[:4] if has_cast and f["cast"] is not None else [],
-            "role_of_person": "director" if as_director else "actor",
-            "vote_count": int(f["vote_count"]),
-        })
-        if len(results) >= limit:
-            break
-
+    for p in hits[:int(limit or 15)]:
+        r = df.iloc[p]
+        results.append(dict(_row(b, p), cast=[str(x) for x in sr.as_list(r.get("cast"))[:4]],
+                            role_of_person="director" if d[p] else "actor"))
     if not results:
         return {"person": person, "results": [],
-                "note": f"No films found for '{person}'. Check spelling, or they may be outside the catalog."}
+                "note": f"No recommendable films found for '{person}'. Check the spelling."}
     return {"person": person, "role_searched": role, "results": results,
-            "note": "Films involving this person, by popularity. Excludes the user's already-rated films."}
+            "note": "Their films that clear the website's quality floor, most-voted first. "
+                    "Excludes films the user rated."}
 
 
 def _tool_search_by_studio(state, studio, limit=15, min_year=None, max_year=None):
-    """Find films from a production studio (e.g. A24, Blumhouse, Studio Ghibli)."""
-    df = state["df"]; ratings = state["ratings"]
+    b = _b(state)
+    df = b["df"]
     if "studio" not in df.columns:
-        return {"results": [], "note": "Studio data not available."}
-    rated_ids = {str(r["movie_id"]) for r in ratings}
-    s = studio.strip().lower()
-    mask = df["studio"].astype(str).str.lower().str.contains(s, na=False, regex=False)
-    hits = df[mask].nlargest(limit + len(rated_ids), "vote_count")
-    has_director = "director" in df.columns
-
+        return {"results": [], "note": "Studio data is not available."}
+    s = (studio or "").strip().lower()
+    m = df["studio"].astype(str).str.lower().str.contains(s, regex=False, na=False).to_numpy()
+    m = m & b["servable"]
+    skip = sr.excluded_positions(b, state["ratings"], state.get("skipped"))
+    vc = sr._num(df, "vote_count").fillna(0).to_numpy()
+    hits = sorted((int(p) for p in np.flatnonzero(m) if int(p) not in skip), key=lambda p: -vc[p])
     results = []
-    for _, f in hits.iterrows():
-        if str(f["id"]) in rated_ids:
+    for p in hits:
+        r = df.iloc[p]
+        if not sr.year_ok(r.get("release_year"), min_year, max_year):
             continue
-        yr = f["release_year"]
-        if min_year is not None and (pd.isna(yr) or yr < min_year):
-            continue
-        if max_year is not None and (pd.isna(yr) or yr > max_year):
-            continue
-        results.append({
-            "title": f["title"],
-            "director": f["director"] if has_director and isinstance(f["director"], str) else "",
-            "year": int(yr) if pd.notna(yr) else None,
-            "studio": f["studio"],
-        })
-        if len(results) >= limit:
+        results.append(dict(_row(b, p), studio=sr.text(r.get("studio"))))
+        if len(results) >= int(limit or 15):
             break
-
     if not results:
-        return {"studio": studio, "results": [],
-                "note": f"No films found for studio '{studio}'."}
+        return {"studio": studio, "results": [], "note": f"No recommendable films for studio '{studio}'."}
     return {"studio": studio, "results": results,
-            "note": "Films from this studio by popularity. Excludes already-rated films."}
+            "note": "Most-voted first. Excludes films the user rated."}
 
 
 # ---------------------------------------------------------------------------
-# Tool schemas
+# Schemas
 # ---------------------------------------------------------------------------
 TOOLS = [
     {
-        "name": "search_user_ratings",
-        "description": "Look at the films the user has rated. Provide a query describing a vibe/genre/mood (e.g. 'heist', 'slow character drama', 'crime') to rank their rated films by SEMANTIC similarity to it. Omit the query to get all ratings. Use to find which of the user's films match a description like 'my crime films'.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Optional vibe/genre/mood, e.g. 'heist' or 'dark thriller'. Omit for all ratings."}
-            },
-        },
+        "name": "get_recommendations",
+        "description": (
+            "The website's own film recommender. With NO anchor_titles it returns exactly the "
+            "website's 'For you' list for this user's whole profile: use it for open requests "
+            "like 'what should I watch tonight'. With anchor_titles it steers the same ranker "
+            "toward those films; the user's other likes still count as seen and dislikes still "
+            "apply. Each pick carries because_of / also_because (the rated films it is closest "
+            "to), matched_tags (tags that lifted it), cast and a blurb. Optional year and "
+            "original-language filters, and avoid_tags to drop anything strongly tagged or "
+            "genred as e.g. 'horror' or 'romance'. Start here for any 'for me' request, "
+            "putting the user's exclusions in avoid_tags."),
+        "input_schema": {"type": "object", "properties": {
+            "anchor_titles": {"type": "array", "items": {"type": "string"},
+                              "description": "Optional. Films to steer toward: rated films or any catalogue title."},
+            "n": {"type": "integer", "description": "How many to return, up to 20 (default 10)."},
+            "min_year": {"type": "integer"}, "max_year": {"type": "integer"},
+            "language": {"type": "string", "description": "e.g. 'Korean', 'Hindi', 'French', or a code like 'ko'."},
+            "avoid_tags": {"type": "array", "items": {"type": "string"},
+                           "description": "Things the user doesn't want, e.g. ['horror']."}}},
     },
     {
-        "name": "get_recommendations",
-        "description": "Get film recommendations from a set of anchor films (titles the user likes). Optionally restrict by year and/or original language. Returns unseen films similar to the anchors, each tagged with which anchor it came from. Excludes the user's rated films and films by directors they've already rated.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "anchor_titles": {"type": "array", "items": {"type": "string"},
-                                  "description": "Titles to base recommendations on (rated or any catalog film)."},
-                "n": {"type": "integer", "description": "How many to return (default 10)."},
-                "min_year": {"type": "integer", "description": "Only films released in or after this year."},
-                "max_year": {"type": "integer", "description": "Only films released in or before this year."},
-                "language": {"type": "string", "description": "Optional original-language filter, e.g. 'Korean', 'Hindi', 'French' (or code 'ko')."},
-            },
-            "required": ["anchor_titles"],
-        },
+        "name": "search_user_ratings",
+        "description": (
+            "The films the user has rated. With a query ('heist', 'slow character drama'), "
+            "returns their rated films ranked by similarity in meaning. Omit the query for all "
+            "ratings, highest first."),
+        "input_schema": {"type": "object", "properties": {"query": {"type": "string"}}},
     },
     {
         "name": "search_catalog",
-        "description": "Check whether a film exists in the catalog and get its details. Use to verify a title before anchoring on it.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Title to search for."},
-                "limit": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
+        "description": (
+            "Look a film up by title, director or cast member. Says whether it is recommendable "
+            "and whether the user already rated it. Use it to verify a title before naming it."),
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string"}, "limit": {"type": "integer"}},
+            "required": ["query"]},
     },
     {
         "name": "search_catalog_semantic",
-        "description": "Semantic search across the ENTIRE catalog by free-text (genre + qualities), with optional language filter. Use when the user asks for a genre/vibe OUTSIDE their rated taste. Pattern: infer qualities they enjoy from their ratings, then query combining the requested genre AND those qualities — e.g. 'cyberpunk noir with stylish action'. For world cinema, set language (e.g. 'Korean'). Excludes rated films and rated directors.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Free-text genre + qualities, e.g. 'heist thriller with twists and ensemble cast'."},
-                "limit": {"type": "integer", "description": "How many results (default 15)."},
-                "min_year": {"type": "integer"},
-                "max_year": {"type": "integer"},
-                "language": {"type": "string", "description": "Optional language, e.g. 'Korean', 'Hindi', 'French'."},
-            },
-            "required": ["query"],
-        },
+        "description": (
+            "Search the whole catalogue by meaning, with an optional language filter. Use for "
+            "requests outside the user's rated taste, combining the genre with qualities they "
+            "enjoy ('horror with stylish tension and a twist'), and for world cinema ('revenge "
+            "thriller', language='Korean'). Excludes rated films and rated directors."),
+        "input_schema": {"type": "object", "properties": {
+            "query": {"type": "string"}, "limit": {"type": "integer"},
+            "min_year": {"type": "integer"}, "max_year": {"type": "integer"},
+            "language": {"type": "string"}},
+            "required": ["query"]},
     },
     {
         "name": "search_by_tags",
-        "description": "Search films by quality-tags (NOT genres). Returns films from the tagged subset (~44K films, 40% of catalog) scoring high on positive tags and optionally low on negative tags. Use for qualities like 'slow-burn crime', 'mind-bending nonlinear', 'feel-good with found-family', 'stylish revenge without romance'. Available tags span pace (fast-paced, slow-burn), mood (dark, atmospheric, melancholic, whimsical, tense, bleak, hopeful, feel-good), experience (mind-bending, twist-ending, non-linear, tearjerker), themes (coming-of-age, revenge, redemption, survival, found-family, forbidden-love, political), and genre-ish (science-fiction, dystopian, cyberpunk, time-travel, space-opera, climate-fiction, horror, thriller, crime, war, satire) plus movie-specific (visually-stunning, stylized-violence, ensemble-cast, animation, musical), source-medium (book-adaptation, comic-adaptation, manga-adaptation, game-adaptation), and sub-genres (superhero, noir, sports, martial-arts, biographical, true-crime, supernatural, heist, queer-rep, grief, slice-of-life, short-film). Returns each film's top contributing tags. Only ~44K films (40%) are tagged — if results are weak, fall back to search_catalog_semantic.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "positive_tags": {"type": "array", "items": {"type": "string"},
-                                  "description": "Tags the film SHOULD score high on."},
-                "negative_tags": {"type": "array", "items": {"type": "string"},
-                                  "description": "Tags the film should score LOW on."},
-                "limit": {"type": "integer"},
-                "min_year": {"type": "integer"},
-                "max_year": {"type": "integer"},
-            },
-        },
+        "description": (
+            "Search films by quality tags (about 40% of the catalogue is tagged). Tags cover pace "
+            "(fast-paced, slow-burn), mood (dark, atmospheric, tense, bleak, feel-good), experience "
+            "(mind-bending, twist-ending, non-linear, tearjerker), themes (revenge, redemption, "
+            "survival, found-family, coming-of-age), genre-ish tags (noir, heist, superhero, "
+            "martial-arts, true-crime, satire, cyberpunk...), and source (book-adaptation, "
+            "comic-adaptation, manga-adaptation). If a tag doesn't exist, the result lists real "
+            "tags to retry with. Fall back to search_catalog_semantic if results are weak."),
+        "input_schema": {"type": "object", "properties": {
+            "positive_tags": {"type": "array", "items": {"type": "string"}},
+            "negative_tags": {"type": "array", "items": {"type": "string"}},
+            "limit": {"type": "integer"},
+            "min_year": {"type": "integer"}, "max_year": {"type": "integer"}}},
     },
     {
         "name": "search_by_people",
-        "description": "Find films by a specific DIRECTOR or top-billed ACTOR. Use for auteur or star following: 'films by Bong Joon-ho', 'movies starring Morgan Freeman', 'more Christopher Nolan'. Set role to 'director', 'actor', or 'any' (default). Excludes the user's already-rated films, sorted by popularity.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "person": {"type": "string", "description": "Director or actor name, e.g. 'Christopher Nolan' or 'Morgan Freeman'."},
-                "role": {"type": "string", "enum": ["director", "actor", "any"],
-                         "description": "Restrict to their director credits, acting credits, or either (default 'any')."},
-                "limit": {"type": "integer"},
-            },
-            "required": ["person"],
-        },
+        "description": (
+            "Films by a director or top-billed actor ('films by Bong Joon-ho', 'movies with "
+            "Denzel Washington'). role: 'director', 'actor' or 'any'. Most-voted first, "
+            "excluding films the user rated."),
+        "input_schema": {"type": "object", "properties": {
+            "person": {"type": "string"},
+            "role": {"type": "string", "enum": ["director", "actor", "any"]},
+            "limit": {"type": "integer"}},
+            "required": ["person"]},
     },
     {
         "name": "search_by_studio",
-        "description": "Find films from a production studio or company, e.g. 'A24', 'Blumhouse', 'Studio Ghibli', 'Marvel Studios'. Use when the user follows a studio's house style. Excludes already-rated films, sorted by popularity.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "studio": {"type": "string", "description": "Studio name, e.g. 'A24'."},
-                "limit": {"type": "integer"},
-                "min_year": {"type": "integer"},
-                "max_year": {"type": "integer"},
-            },
-            "required": ["studio"],
-        },
+        "description": "Films from a studio ('A24', 'Blumhouse', 'Studio Ghibli'). Most-voted first.",
+        "input_schema": {"type": "object", "properties": {
+            "studio": {"type": "string"}, "limit": {"type": "integer"},
+            "min_year": {"type": "integer"}, "max_year": {"type": "integer"}},
+            "required": ["studio"]},
     },
 ]
 
 TOOL_IMPLS = {
-    "search_user_ratings": _tool_search_user_ratings,
     "get_recommendations": _tool_get_recommendations,
+    "search_user_ratings": _tool_search_user_ratings,
     "search_catalog": _tool_search_catalog,
     "search_catalog_semantic": _tool_search_catalog_semantic,
     "search_by_tags": _tool_search_by_tags,
@@ -515,185 +362,39 @@ TOOL_IMPLS = {
     "search_by_studio": _tool_search_by_studio,
 }
 
-SYSTEM_PROMPT = """You are a thoughtful film recommendation assistant. You help the user find movies to watch based on their taste and their requests.
+SYSTEM_PROMPT = """You are a thoughtful film recommendation assistant. You help the user find films to watch, based on their ratings and their request.
 
-You are strictly a film recommendation assistant. If the user asks for anything unrelated to movies (general questions, code, other topics), politely redirect: "I'm focused on film recommendations — what kind of movie are you in the mood for?"
+You only do film recommendations. If asked about anything else, say: "I'm focused on film recommendations — what kind of movie are you in the mood for?"
 
-You have seven tools:
-- search_user_ratings: inspect what the user has rated, with optional semantic query
-- get_recommendations: find films similar to anchor films they've rated (best when their taste matches the request); supports year + language filters
-- search_catalog: look up a specific title
-- search_catalog_semantic: search the WHOLE catalog by free-text (genre + qualities), with optional language filter — use for requests outside their rated taste
-- search_by_tags: search the ~44K tagged films by quality-tags (pace, mood, themes, structure, source medium, sub-genre)
-- search_by_people: find films by a director or actor (auteur / star following)
-- search_by_studio: find films from a studio (A24, Blumhouse, Ghibli, ...)
+Choose a path:
 
-Decide which path the request needs:
+**Open request** ("what should I watch tonight?", "a must-see list for me"): get_recommendations with no anchors. That is the website's own list for their profile. Put anything they rule out ("no horror") in avoid_tags. Only add catalogue or tag searches if that list is too thin, and say which picks came from the wider search.
 
-**Path A — request fits their taste** (e.g. "more like my heist films", "something recent like the crime films I enjoy"):
-1. search_user_ratings WITH a query to find which rated films fit the description.
-2. get_recommendations with those matched films as anchors.
-3. Explain why each pick fits.
+**Path A — fits their taste** ("more like my heist films"): search_user_ratings with a query, then get_recommendations with the matching films as anchor_titles.
 
-**Path B — request is OUTSIDE their rated taste** (e.g. they ask for horror/romance/sci-fi but their ratings are mostly crime):
-1. search_user_ratings WITHOUT a query to see the full taste picture.
-2. Identify 2-3 qualities the user reliably enjoys (twists, stylish violence, fast pace, ensemble casts, dark humor, character focus). Reference specific films they rated highly.
-3. Call search_catalog_semantic with a query combining the requested genre + those qualities. e.g. "horror with stylish tension and a twist".
-4. Present picks by EXPLICITLY BRIDGING: "You rated [film] highly for [quality] — here's a horror film with that same [quality]." Don't just dump genre results; show why these fit them.
+**Path B — outside their taste** ("I want horror" from someone who rates crime): search_user_ratings without a query, pick 2-3 qualities they reliably enjoy (name the films), then search_catalog_semantic combining the genre with those qualities. Bridge explicitly: "You rated X highly for its Y; this has the same Y."
 
-**Path C — request is QUALITY-based** (e.g. "mind-bending non-linear films", "slow-burn revenge", "feel-good found-family"):
-1. Use search_by_tags with positive_tags for the qualities, optionally negative_tags to avoid.
-2. Cross-reference with their taste — note which returned films share tags with what they rated highly.
-3. Explain picks by referencing the specific tags.
-4. ~44K films (40%) are tagged — if results are weak, fall back to search_catalog_semantic.
+**Path C — quality request** ("mind-bending non-linear", "slow-burn revenge"): search_by_tags, falling back to search_catalog_semantic if thin.
 
-**Path D — request is PEOPLE or STUDIO based** (e.g. "movies by Bong Joon-ho", "films with Denzel Washington", "more A24"):
-1. Use search_by_people (set role to director/actor/any) or search_by_studio.
-2. Optionally cross-reference taste: note which picks align with qualities they enjoy.
+**Path D — people or studio** ("films by Bong Joon-ho", "more A24"): search_by_people or search_by_studio.
 
-**Language / world cinema** ("Korean thrillers", "Bollywood", "French crime"): add the language filter to get_recommendations or search_catalog_semantic.
+**World cinema** ("Korean thrillers", "Bollywood"): set the language on get_recommendations or search_catalog_semantic.
 
-You can COMBINE paths: for "Korean revenge thrillers like the crime films I like," search_by_tags(positive=[revenge, thriller]) or search_catalog_semantic('revenge thriller', language='Korean'), then bridge to their taste.
+EXPLAINING PICKS: for get_recommendations results, the reasons are because_of, also_because and matched_tags; those are why the ranker chose the film. For search results, explain by the query, tags or person that found it. Describe a film only from its blurb, genres and tags. If a result has no blurb, don't summarise its plot from your own knowledge, even if you know the film well.
 
-CRITICAL — GROUNDING RULE (read carefully):
-Every single film you name in a recommendation MUST appear, by title, in a tool result you received in THIS conversation. This is an absolute rule:
-- Do NOT add films from your own knowledge, even if they fit the request perfectly and you are confident they exist. If a great film comes to mind but it is not in your tool results, you may NOT name it — instead, run another tool search to try to surface it.
-- Never recommend films the user has already rated (visible via search_user_ratings).
-- If your tool results don't contain enough good matches, say so honestly and offer to search differently, rather than padding the list with films from memory.
-- Prefer the EXACT titles as they appear in the tool results. Do not rename, retranslate, or "correct" them.
-- When in doubt about whether a film is in the catalog, call search_catalog to verify before naming it.
-The recommender's entire value is that it is grounded in this specific catalog and the user's actual ratings. A recommendation the tools didn't return is worse than no recommendation — it breaks trust and may point to a film that isn't in the catalog at all.
+GROUNDING RULE — absolute:
+- Every film you name must appear, by title, in a tool result from THIS conversation. Never add a film from your own knowledge, however sure you are; run another search instead.
+- Never recommend a film the user has already rated.
+- Use titles exactly as the tools returned them.
+- Write each recommended film as **Title** (Director, Year), using the tool's values.
+- If the results are weak, say so and offer to search differently rather than padding the list.
 
-When a user asks for "something to watch" without specifying, treat it as Path B: infer qualities from their ratings, then search_catalog_semantic for fresh unseen films matching those qualities + any constraint they gave.
-
-Other guidance:
-- For mood shifts ("lighter", "darker", "faster") the tools can't filter directly, use judgment to pick from results and explain.
-- Be concise and warm. Reference the user's taste in your explanations.
-- If recommendations would be weak, say so honestly rather than forcing them.
-- The catalog is films only (no books/TV), spanning world cinema up to 2025."""
+Be concise and warm, and refer to the user's own films when explaining."""
 
 
-def _titles_from_result(result):
-    """Pull every film title out of a tool result dict (any tool's shape)."""
-    titles = set()
-    if not isinstance(result, dict):
-        return titles
-    for key in ("recommendations", "results", "matched_films", "ratings"):
-        items = result.get(key)
-        if isinstance(items, list):
-            for it in items:
-                if isinstance(it, dict) and it.get("title"):
-                    titles.add(it["title"])
-    return titles
-
-
-def _check_faithfulness(reply, seen_titles):
-    """Find film titles in the reply that were never returned by any tool.
-
-    Precision matters: we only treat a phrase as a *film title* if it is
-    shaped like one — i.e. immediately followed by a parenthetical containing
-    a 4-digit year and/or a director, e.g.:
-        "Smokin' Aces (Joe Carnahan, 2006)"
-        "Ocean's Eleven (2001)"
-        "**Snatch** (Guy Ritchie, 2000)"
-    This avoids flagging prose fragments ("Why these fit:", "exactly") that a
-    looser bold/numbered-list scan would wrongly catch.
-    Returns a list of suspicious (likely-hallucinated) titles.
-    """
-    import re
-
-    # Title candidate = text right before a parenthetical that contains a year.
-    # Capture the run of words (optionally bolded) preceding "(... 19xx/20xx ...)".
-    pattern = re.compile(
-        r"(?:\*\*)?"                       # optional opening bold
-        r"([A-Z0-9][^\n*()]{1,70}?)"       # the title text (starts capitalized)
-        r"(?:\*\*)?"                       # optional closing bold
-        r"\s*\((?:[^)]*?\b(?:19|20)\d{2}\b[^)]*)\)"  # ( ... yyyy ... )
-    )
-    cands = [m.group(1).strip().rstrip(":–-—").strip() for m in pattern.finditer(reply)]
-    # strip any leading list-number prefix ("1. Title" -> "Title")
-    cands = [re.sub(r"^\d+\.\s*", "", c).strip() for c in cands]
-
-    def norm(s):
-        return "".join(ch for ch in s.lower() if ch.isalnum())
-
-    seen_norm = {norm(t) for t in seen_titles}
-    suspicious, suspicious_norms = [], set()
-    for c in cands:
-        cn = norm(c)
-        if len(cn) < 3 or cn in suspicious_norms:
-            continue
-        if cn in seen_norm:
-            continue
-        if any(cn in s or s in cn for s in seen_norm if len(s) >= 4):
-            continue
-        suspicious.append(c)
-        suspicious_norms.add(cn)
-    return suspicious
-
-
-def run_agent(user_message, state, conversation_history=None, max_turns=6, verbose=True):
-    """Run the agentic loop. Returns (final_text, updated_history).
-
-    Tracks every title returned by tools and, after the model's final answer,
-    checks whether the answer names any film the tools never returned (a sign
-    of the model freelancing from memory). When verbose, prints the returned
-    titles and any suspicious (likely-hallucinated) ones.
-    """
-    client = Anthropic()
-    history = conversation_history or []
-    history = history + [{"role": "user", "content": user_message}]
-
-    # Conversation-scoped, not turn-scoped. The grounding rule says "in THIS
-    # conversation", and a follow-up like "tell me about the third one" makes
-    # no tool calls -- with a per-turn reset it flagged the answer as a
-    # hallucination. Lives on `state` so it survives across messages.
-    seen_titles = state.setdefault("_seen_titles", set())
-
-    for turn in range(max_turns):
-        resp = client.messages.create(
-            model=MODEL, max_tokens=1500, system=SYSTEM_PROMPT,
-            tools=TOOLS, messages=history,
-        )
-        tool_calls = [b for b in resp.content if b.type == "tool_use"]
-        text_blocks = [b.text for b in resp.content if b.type == "text"]
-        history.append({"role": "assistant", "content": resp.content})
-
-        if not tool_calls:
-            reply = "\n".join(text_blocks)
-            # faithfulness check against everything the tools returned
-            suspicious = _check_faithfulness(reply, seen_titles)
-            if verbose and suspicious:
-                print(f"  [!] WARNING: {len(suspicious)} title(s) in the reply were "
-                      f"NOT in any tool result (possible hallucination):")
-                for s in suspicious:
-                    print(f"        - {s}")
-            elif verbose:
-                print(f"  [ok] all recommended titles were grounded in tool results "
-                      f"({len(seen_titles)} films seen across tools)")
-            return reply, history
-
-        tool_results = []
-        for tc in tool_calls:
-            impl = TOOL_IMPLS.get(tc.name)
-            try:
-                result = impl(state, **tc.input)
-            except Exception as e:
-                result = {"error": str(e)}
-            returned = _titles_from_result(result)
-            seen_titles |= returned
-            if verbose:
-                print(f"  [agent calls {tc.name}({json.dumps(tc.input)})]")
-                if returned:
-                    preview = list(returned)[:8]
-                    more = f" (+{len(returned) - 8} more)" if len(returned) > 8 else ""
-                    print(f"        -> returned {len(returned)} films: {', '.join(preview)}{more}")
-                else:
-                    print(f"        -> (no film titles in result)")
-            tool_results.append({
-                "type": "tool_result", "tool_use_id": tc.id,
-                "content": json.dumps(result),
-            })
-        history.append({"role": "user", "content": tool_results})
-
-    return "(agent hit max turns without finishing)", history
+def run_agent(user_message, state, conversation_history=None, max_turns=8, verbose=True):
+    """Returns (reply, history). The grounding result is left in state["_last_check"]."""
+    return run_agent_loop(user_message, state, system=SYSTEM_PROMPT, tools=TOOLS,
+                          impls=TOOL_IMPLS, noun="films",
+                          conversation_history=conversation_history,
+                          max_turns=max_turns, verbose=verbose)

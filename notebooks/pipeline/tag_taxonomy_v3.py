@@ -63,7 +63,9 @@ FORM_TAGS = {
     "poetry",
     "graphic-novel",
     "play",
-    "epic",                # mythological or classical narrative
+    # "epic" was here and was removed after the pilot: the model reads it as a
+    # SCALE word ("epic fantasy"), so it landed beside `novel` on 59 of 300
+    # books and gave them two forms. A Mahabharata retelling is a `novel`.
 }
 
 # ---------------------------------------------------------------------------
