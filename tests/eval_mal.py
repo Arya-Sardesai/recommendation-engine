@@ -47,6 +47,7 @@ USAGE
     python tests\\eval_mal.py --mal-dir data\\raw\\tv\\mal --stage link
     python tests\\eval_mal.py --mal-dir data\\raw\\tv\\mal --users 200
     python tests\\eval_mal.py --mal-dir data\\raw\\tv\\mal --users 200 --ablate
+    python tests\\eval_mal.py --mal-dir data\\raw\\tv\\mal --port-fixes --users 300 --folds 3
 """
 import argparse
 import json
@@ -353,56 +354,78 @@ def collapse_seasons(g, links):
     return out
 
 
+def _score_split(train, test, df, emb, index, tags_df, rec, links, pos, params,
+                 k_list, uid):
+    """Recall per k for one train/test split. None = unusable split, and the
+    string 'fail' = the ranker raised (logged)."""
+    rel = {links[int(a)] for a, r in zip(test["anime"], test["rating"])
+           if r >= LIKE and int(a) in links}
+    if not rel or len(train) < 5:
+        return None
+    ratings = []
+    for a, r in zip(train["anime"], train["rating"]):
+        tid = links.get(int(a))
+        ci = pos.get(tid)
+        if ci is None:
+            continue
+        ratings.append({"tv_id": tid, "corpus_index": ci,
+                        "matched_title": str(df.iloc[ci]["name"]),
+                        "matched_creator": "",
+                        # MAL 1-10 -> the app's 1-5 scale
+                        "rating": float(r) / 2.0})
+    if len(ratings) < 5:
+        return None
+    try:
+        recs, _ = rec(ratings, df, emb, index, tags_df=tags_df, n=max(k_list),
+                      **params)
+    except Exception as e:
+        print(f"    user {uid} failed: {type(e).__name__}: {e}")
+        return "fail"
+    got = [int(x) for x in recs["tmdb_id"].tolist()] if len(recs) else []
+    return {k: len(set(got[:k]) & rel) / max(len(rel), 1) for k in k_list}
+
+
 def eval_users(users, df, emb, index, tags_df, rec, links, pos,
-               params=None, k_list=(10, 20, 50), seed=SEED, label=""):
+               params=None, k_list=(10, 20, 50), seed=SEED, label="", folds=1):
+    """folds=1 is the original single 70/30 split (same RNG draws, so earlier
+    numbers reproduce). folds=K holds each part of a user's (season-collapsed)
+    ratings out once and averages, so each user still counts once and the
+    per-user vector stays paired across configs."""
     params = params or {}
     rng = np.random.default_rng(seed)
     acc = {k: [] for k in k_list}
-    per_user_r20 = []
+    per_user = {k: [] for k in k_list}
     n_ok = skipped = 0
-    maxk = max(k_list)
 
     for i, (uid, g) in enumerate(users.items(), 1):
         g = collapse_seasons(g, links)
         rows = g.sample(frac=1.0, random_state=int(rng.integers(1 << 30)))
-        cut = int(len(rows) * 0.7)
-        train, test = rows.iloc[:cut], rows.iloc[cut:]
-        rel = {links[int(a)] for a, r in zip(test["anime"], test["rating"])
-               if r >= LIKE and int(a) in links}
-        if not rel or len(train) < 5:
-            skipped += 1
-            per_user_r20.append(np.nan)
-            continue
-
-        ratings = []
-        for a, r in zip(train["anime"], train["rating"]):
-            tid = links.get(int(a))
-            ci = pos.get(tid)
-            if ci is None:
+        if folds <= 1:
+            cut = int(len(rows) * 0.7)
+            splits = [(rows.iloc[:cut], rows.iloc[cut:])]
+        else:
+            parts = np.array_split(np.arange(len(rows)), folds)
+            splits = [(rows.drop(rows.index[p]), rows.iloc[p]) for p in parts]
+        u = {k: [] for k in k_list}
+        failed = False
+        for train, test in splits:
+            res = _score_split(train, test, df, emb, index, tags_df, rec, links,
+                               pos, params, k_list, uid)
+            if res == "fail":
+                failed = True
+                break
+            if res is None:
                 continue
-            ratings.append({"tv_id": tid, "corpus_index": ci,
-                            "matched_title": str(df.iloc[ci]["name"]),
-                            "matched_creator": "",
-                            # MAL 1-10 -> the app's 1-5 scale
-                            "rating": float(r) / 2.0})
-        if len(ratings) < 5:
+            for k in k_list:
+                u[k].append(res[k])
+        if failed or not u[k_list[0]]:
             skipped += 1
-            per_user_r20.append(np.nan)
+            for k in k_list:
+                per_user[k].append(np.nan)
             continue
-
-        try:
-            recs, _ = rec(ratings, df, emb, index, tags_df=tags_df, n=maxk,
-                          **params)
-        except Exception as e:
-            print(f"    user {uid} failed: {type(e).__name__}: {e}")
-            skipped += 1
-            per_user_r20.append(np.nan)
-            continue
-
-        got = [int(x) for x in recs["tmdb_id"].tolist()] if len(recs) else []
         for k in k_list:
-            acc[k].append(len(set(got[:k]) & rel) / max(len(rel), 1))
-        per_user_r20.append(len(set(got[:20]) & rel) / max(len(rel), 1))
+            acc[k].append(float(np.mean(u[k])))
+            per_user[k].append(float(np.mean(u[k])))
         n_ok += 1
         if i % 25 == 0:
             print(f"  {label}[{i}/{len(users)}]")
@@ -413,8 +436,9 @@ def eval_users(users, df, emb, index, tags_df, rec, links, pos,
                 float(a.std(ddof=1) / np.sqrt(len(a))) if len(a) > 1 else 0.0)
 
     out = {f"r{k}": ms(acc[k]) for k in k_list}
+    out["_per_user"] = {k: np.array(v, dtype=float) for k, v in per_user.items()}
     print(f"  {label}evaluated {n_ok} users ({skipped} skipped)")
-    return out, np.array(per_user_r20, dtype=float)
+    return out, np.array(per_user[20 if 20 in k_list else k_list[0]], dtype=float)
 
 
 def eval_pop(users, df, links, k_list=(10, 20, 50), within_linked=True):
@@ -471,6 +495,114 @@ def paired_t(full, abl):
     return float(d.mean()), float(d.mean() / se)
 
 
+def paired_bootstrap(base, other, n_boot=10000, seed=SEED):
+    """95% range of mean(other - base) over users (resampled with replacement)
+    and the share of resamples where `other` loses. Positive = `other` better.
+    Same method as eval_goodbooks and eval_movielens."""
+    m = ~(np.isnan(base) | np.isnan(other))
+    d = other[m] - base[m]
+    if len(d) < 2:
+        return 0.0, 0.0, 0.0, 0.5
+    rng = np.random.default_rng(seed)
+    means = d[rng.integers(0, len(d), size=(n_boot, len(d)))].mean(axis=1)
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return float(d.mean()), float(lo), float(hi), float((means < 0).mean())
+
+
+# Ported book-ranker fixes. PORT_OLD pins the switches off so the base stays
+# the pre-port ranker even after the TV_* constants in app.py are flipped.
+PORT_OLD = {"neg_floor_k": 0, "sim_scale": 1.0, "tag_idf": 0.0}
+PORT_FIXES = [
+    ("shipped (all off)",      PORT_OLD),
+    ("floor only",             {**PORT_OLD, "neg_floor_k": 200}),
+    ("floor + sim x2",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 2.0}),
+    ("floor + sim x3",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0}),
+    ("floor + sim x5",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 5.0}),
+    ("floor + sim x3 + idf 1", {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0,
+                                "tag_idf": 1.0}),
+]
+
+
+def run_port_fixes(users, df, emb, index, tags_df, rec, links, pos, base_params,
+                   folds):
+    rows, per = [], {}
+    for name, p in PORT_FIXES:
+        merged = dict(base_params)
+        merged.update(p)
+        print(f"\nrunning: {name}")
+        s, _ = eval_users(users, df, emb, index, tags_df, rec, links, pos,
+                          params=merged, label=f"{name}: ", folds=folds)
+        per[name] = s.pop("_per_user")
+        rows.append((name, s))
+    base = PORT_FIXES[0][0]
+    print("\n" + "=" * 100)
+    print(f"  {len(users)} users, {folds}-fold"
+          + (" (single 70/30 split)" if folds <= 1 else ""))
+    print(f"{'config':<24}{'recall@20':>13}{'recall@50':>13}{'d r@20':>10}"
+          f"{'95% range (bootstrap)':>26}{'P(worse)':>10}")
+    print("-" * 100)
+    for name, r in rows:
+        line = (f"{name:<24}{r['r20'][0]:>8.4f}±{r['r20'][1]:<4.3f}"
+                f"{r['r50'][0]:>8.4f}±{r['r50'][1]:<4.3f}")
+        if name != base:
+            d, lo, hi, pw = paired_bootstrap(per[base][20], per[name][20])
+            flag = "  <<" if (lo > 0 or hi < 0) else ""
+            line += f"{d:>+10.4f}{f'[{lo:+.4f}, {hi:+.4f}]':>26}{pw:>9.0%}{flag}"
+        print(line)
+    print("=" * 100)
+    print("d r@20 is paired per user vs the first row; positive = better.")
+    print("<< = the bootstrap range excludes zero. Ship a config if its range")
+    print("includes zero or sits above it AND real titles read better; then set")
+    print("TV_NEG_FLOOR_K / TV_SIM_SCALE / TV_TAG_IDF at the top of app.py.")
+    print("This is ANIME recall: check eval_tv_loo --port-fixes before shipping.")
+
+
+AWARD_SWEEP = [
+    ("no bonus",     0.0,  0.0),
+    ("0.04 / 0.02",  0.04, 0.02),
+    ("0.10 / 0.05",  0.10, 0.05),
+    ("0.25 / 0.125", 0.25, 0.125),
+    ("0.50 / 0.25",  0.50, 0.25),
+]
+
+
+def run_award_sweep(users, df, emb, index, tags_df, rec, links, pos, base_params,
+                    folds, awards):
+    """Same paired design as --port-fixes. Read it knowing that anime awards
+    are thin in this catalogue (Emmys and Globes rarely go to anime), so the
+    bonus can only move the few anime that have one -- a tie here says little
+    about live-action TV. eval_tv_loo --award-sweep covers your own profile."""
+    rows, per = [], {}
+    for name, w, nm in AWARD_SWEEP:
+        merged = dict(base_params)
+        merged.update({"awards": awards, "award_win": w, "award_nom": nm})
+        print(f"\nrunning: {name}")
+        s, _ = eval_users(users, df, emb, index, tags_df, rec, links, pos,
+                          params=merged, label=f"{name}: ", folds=folds)
+        per[name] = s.pop("_per_user")
+        rows.append((name, s))
+    linked = set(links.values())
+    covered = sum(1 for t in linked if awards.get(int(t), {}).get("major"))
+    base = AWARD_SWEEP[0][0]
+    print("\n" + "=" * 100)
+    print(f"  {len(users)} users, {folds}-fold. MAL-linked titles with a major award: "
+          f"{covered:,} of {len(linked):,}")
+    print(f"{'config':<18}{'recall@20':>13}{'recall@50':>13}{'d r@20':>10}"
+          f"{'95% range (bootstrap)':>26}{'P(worse)':>10}")
+    print("-" * 100)
+    for name, r in rows:
+        line = (f"{name:<18}{r['r20'][0]:>8.4f}±{r['r20'][1]:<4.3f}"
+                f"{r['r50'][0]:>8.4f}±{r['r50'][1]:<4.3f}")
+        if name != base:
+            d, lo, hi, pw = paired_bootstrap(per[base][20], per[name][20])
+            flag = "  <<" if (lo > 0 or hi < 0) else ""
+            line += f"{d:>+10.4f}{f'[{lo:+.4f}, {hi:+.4f}]':>26}{pw:>9.0%}{flag}"
+        print(line)
+    print("=" * 100)
+    print("Paired vs 'no bonus'; positive = better. If few linked titles carry an")
+    print("award, every row ties by construction -- that is coverage, not a verdict.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mal-dir", required=True)
@@ -482,6 +614,13 @@ def main():
     ap.add_argument("--ablate", action="store_true")
     ap.add_argument("--as-deployed", action="store_true",
                     help="measure the shipped config instead of the scoring")
+    ap.add_argument("--port-fixes", action="store_true",
+                    help="A/B the floored dislike penalty, similarity stretch "
+                         "and tag IDF ported from the books ranker")
+    ap.add_argument("--folds", type=int, default=1,
+                    help="K-fold per user; 1 = the original single 70/30 split")
+    ap.add_argument("--award-sweep", action="store_true",
+                    help="sweep the award bonus (needs data/processed/tv_awards.parquet)")
     args = ap.parse_args()
 
     if args.stage == "inspect":
@@ -528,6 +667,18 @@ def main():
           else "SCORING ONLY (suppressors and serving floor lifted)")
 
     rec = ns["recommend_tv"]
+    if args.award_sweep:
+        apath = art.get("AWARDS")
+        if apath is None or not Path(apath).exists():
+            sys.exit("no tv_awards.parquet -- run build_screen_awards.py --stage build first")
+        awards = ns["award_summaries"](pd.read_parquet(apath))
+        run_award_sweep(users, df, emb, index, tags_df, rec, links, pos, base,
+                        args.folds, awards)
+        return
+    if args.port_fixes:
+        run_port_fixes(users, df, emb, index, tags_df, rec, links, pos, base,
+                       args.folds)
+        return
     configs = ABLATIONS if args.ablate else [("full", {})]
     rows, vectors = [], {}
     for name, p in configs:
@@ -535,7 +686,8 @@ def main():
         merged.update(p)
         print(f"\nrunning: {name}")
         s, v = eval_users(users, df, emb, index, tags_df, rec, links, pos,
-                          params=merged, label=f"{name}: ")
+                          params=merged, label=f"{name}: ", folds=args.folds)
+        s.pop("_per_user", None)
         rows.append((name, s))
         vectors[name] = v
 

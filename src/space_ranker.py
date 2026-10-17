@@ -65,6 +65,7 @@ _SPEC = {
     "movie": {
         "corpus": "load_movies_corpus", "index": "load_movies_index",
         "tags": "load_movies_tags", "search_index": "build_movie_search_index",
+        "awards": "load_movie_awards",
         "search": "search_movies", "rank": "recommend_movies",
         "id_col": "id", "title_col": "title", "year_col": "release_year",
         "people_col": "director", "pop_col": "vote_count",
@@ -74,6 +75,7 @@ _SPEC = {
     "tv": {
         "corpus": "load_tv_corpus", "index": "load_tv_index",
         "tags": "load_tv_tags", "search_index": "build_tv_search_index",
+        "awards": "load_tv_awards",
         "search": "search_tv", "rank": "recommend_tv",
         "id_col": "tmdb_id", "title_col": "name", "year_col": "start_year",
         "people_col": "created_by", "pop_col": "vote_count",
@@ -84,7 +86,7 @@ _SPEC = {
 
 # Call-site arguments that are expressions in app.py (session state, loaded
 # frames) rather than literals. The agent supplies its own equivalent.
-_DYNAMIC_ARGS = {"tags_df", "skip_ids", "forms"}
+_DYNAMIC_ARGS = {"tags_df", "skip_ids", "forms", "awards"}
 
 _NS = None
 _BUNDLES = {}
@@ -222,6 +224,10 @@ def load(kind):
     index = ns[spec["index"]]()
     tags = ns[spec["tags"]]()                      # None if missing, as on the Space
     forms = ns["load_books_forms"]() if kind == "book" else {}
+    # Award summaries (films/TV). Optional: an older app.py has no loader, and
+    # a missing file loads as {} -- the Space treats it the same way.
+    _aw = ns.get(spec.get("awards") or "")
+    awards = _aw() if callable(_aw) else {}
 
     rows = {"parquet": len(df), "faiss": int(index.ntotal)}
     emb = files.get("EMB")
@@ -239,6 +245,7 @@ def load(kind):
     b = {
         "kind": kind, "spec": spec, "ns": ns, "df": df, "index": index,
         "emb": ns["IndexVectors"](index), "tags": tags, "forms": forms or {},
+        "awards": awards or {},
         "files": {k: p.name for k, p in files.items()}, "rows": rows,
         "call_literal": literal, "call_keywords": keywords,
         "call_problems": problems,
@@ -433,7 +440,7 @@ def rank(bundle, ratings, skipped=None, n=None, anchor_positions=None):
 
     kwargs = dict(bundle["call_literal"])
     dynamic = {"tags_df": bundle["tags"], "skip_ids": list(skipped or []),
-               "forms": bundle["forms"]}
+               "forms": bundle["forms"], "awards": bundle.get("awards") or {}}
     for k in bundle["call_keywords"]:
         if k in dynamic:
             kwargs[k] = dynamic[k]
@@ -553,6 +560,16 @@ def tag_search(bundle, pos_tags, neg_tags, skip_positions, keep=None, limit=15):
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+def award_note(bundle, tmdb_id):
+    """The award summary the Space's trophy tooltip shows, or None."""
+    aw = bundle.get("awards") or {}
+    try:
+        a = aw.get(int(tmdb_id))
+    except (TypeError, ValueError):
+        return None
+    return a["tip"] if a else None
+
+
 def norm_title(s):
     """Lower-case alphanumerics only: the key the grounding check compares on."""
     return "".join(ch for ch in str(s).lower() if ch.isalnum())

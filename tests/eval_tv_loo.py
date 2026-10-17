@@ -40,6 +40,7 @@ USAGE
     python tests\\eval_tv_loo.py tests\\movies_ratings.json
     python tests\\eval_tv_loo.py tests\\movies_ratings.json --ablate
     python tests\\eval_tv_loo.py tests\\movies_ratings.json --ablate --max-k 50
+    python tests\\eval_tv_loo.py tests\\movies_ratings.json --port-fixes
 """
 import argparse
 import json
@@ -71,6 +72,43 @@ ABLATIONS = [
     ("no cross-pollination", {"cross_weight": 0.0}),
     ("flat (no diversity)",  {"flat_ranking": True}),
 ]
+
+
+# Ported book-ranker fixes, each against the ranker as it shipped before them.
+# PORT_OLD pins the switches off so the base stays the pre-port ranker even
+# after the TV_* constants in app.py are flipped.
+PORT_OLD = {"neg_floor_k": 0, "sim_scale": 1.0, "tag_idf": 0.0}
+PORT_FIXES = [
+    ("shipped (all off)",      PORT_OLD),
+    ("floor only",             {**PORT_OLD, "neg_floor_k": 200}),
+    ("floor + sim x2",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 2.0}),
+    ("floor + sim x3",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0}),
+    ("floor + sim x5",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 5.0}),
+    ("floor + sim x3 + idf 1", {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0,
+                                "tag_idf": 1.0}),
+]
+
+
+AWARD_SWEEP = [
+    ("no bonus",     {"award_win": 0.0,  "award_nom": 0.0}),
+    ("0.04 / 0.02",  {"award_win": 0.04, "award_nom": 0.02}),
+    ("0.10 / 0.05",  {"award_win": 0.10, "award_nom": 0.05}),
+    ("0.25 / 0.125", {"award_win": 0.25, "award_nom": 0.125}),
+    ("0.50 / 0.25",  {"award_win": 0.50, "award_nom": 0.25}),
+]
+
+
+def bootstrap_rr(base_ranks, other_ranks, n_boot=10000, seed=17):
+    """95% range of the mean per-holdout reciprocal-rank gain (other - base),
+    resampling holdouts. Positive = `other` ranks the held-out show higher."""
+    d = np.array([(1.0 / b if b else 0.0) - (1.0 / a if a else 0.0)
+                  for a, b in zip(base_ranks, other_ranks)], dtype=float)
+    if len(d) < 2:
+        return 0.0, 0.0, 0.5
+    rng = np.random.default_rng(seed)
+    means = d[rng.integers(0, len(d), size=(n_boot, len(d)))].mean(axis=1)
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return float(lo), float(hi), float((means < 0).mean())
 
 
 def load_tv_ratings(path):
@@ -161,6 +199,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("ratings")
     ap.add_argument("--ablate", action="store_true")
+    ap.add_argument("--award-sweep", action="store_true",
+                    help="sweep the award bonus (needs data/processed/tv_awards.parquet)")
+    ap.add_argument("--port-fixes", action="store_true",
+                    help="A/B the floored dislike penalty, similarity stretch "
+                         "and tag IDF ported from the books ranker")
     ap.add_argument("--max-k", type=int, default=MAX_K)
     ap.add_argument("--min-votes", type=int, default=0,
                     help="0 (default) measures the SCORING; 300 is the deployed "
@@ -263,7 +306,17 @@ def main():
         print("  conclusion from this.\n")
 
     rec = ns["recommend_tv"]
-    configs = ABLATIONS if args.ablate else [("full", {})]
+    awards = None
+    if args.award_sweep:
+        apath = art.get("AWARDS")
+        if apath is None or not Path(apath).exists():
+            sys.exit("no tv_awards.parquet -- run build_screen_awards.py --stage build first")
+        awards = ns["award_summaries"](pd.read_parquet(apath))
+        configs = [(n, dict(p, awards=awards)) for n, p in AWARD_SWEEP]
+    elif args.port_fixes:
+        configs = PORT_FIXES
+    else:
+        configs = ABLATIONS if args.ablate else [("full", {})]
 
     results = {}
     for name, params in configs:
@@ -279,6 +332,37 @@ def main():
         ids = rank_popularity(rest, df, args.max_k, args.min_votes)
         t = str(held["tv_id"])
         pop_ranks.append(ids.index(t) + 1 if t in ids else None)
+
+    if args.port_fixes or args.award_sweep:
+        base = configs[0][0]
+        if awards is not None:
+            # what the lists turn into on THIS profile, whole profile, top 20
+            print("\n  award share of your top 20 (whole profile):")
+            for name, p in configs:
+                recs, _ = rec(ratings, df, emb, index, tags_df=tags_df, n=20,
+                              min_votes=args.min_votes, **p)
+                ids = [int(x) for x in recs["tmdb_id"]] if len(recs) else []
+                sh = np.mean([bool(awards.get(i, {}).get("major")) for i in ids]) if ids else 0.0
+                print(f"    {name:<16}{sh:>5.0%}")
+        print("\n" + "=" * 96)
+        print(f"{'config':<24}{'hit@10':>9}{'hit@20':>9}{'MRR':>9}{'dMRR':>9}{'t':>7}"
+              f"{'95% range (bootstrap)':>24}{'P(worse)':>10}")
+        print("-" * 96)
+        for name, _ in configs:
+            m = metrics(results[name])
+            line = f"{name:<24}{m['hit@10']:>9.3f}{m['hit@20']:>9.3f}{m['mrr']:>9.3f}"
+            if name != base:
+                d, t = paired_t(results[name], results[base])   # + = better
+                lo, hi, pw = bootstrap_rr(results[base], results[name])
+                flag = "  <<" if (lo > 0 or hi < 0) else ""
+                line += (f"{d:>+9.4f}{t:>7.1f}{f'[{lo:+.4f}, {hi:+.4f}]':>24}"
+                         f"{pw:>9.0%}{flag}")
+            print(line)
+        print("=" * 96)
+        print("dMRR is paired per holdout vs the first row; POSITIVE = BETTER here")
+        print("(the --ablate table uses the opposite sign). One profile, so read")
+        print("this beside eval_mal --port-fixes, not instead of it.")
+        return
 
     print("\n" + "=" * 74)
     print(f"{'method':<24}{'hit@10':>9}{'hit@20':>9}{'MRR':>9}"

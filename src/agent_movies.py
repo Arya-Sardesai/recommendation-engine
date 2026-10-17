@@ -42,13 +42,16 @@ def _row(b, pos):
            "year": sr.year_of(r.get("release_year")),
            "language": b["ns"]["lang_label"](r.get("original_language")),
            "genres": sr.split_genres(r.get("genres"))[:3]}
+    aw = sr.award_note(b, r.get("id"))
+    if aw:
+        out["awards"] = aw
     blurb = sr.short(r.get("overview"), 160)
     if blurb:
         out["blurb"] = blurb
     return out
 
 
-def _rec_row(rec):
+def _rec_row(rec, b=None):
     out = {"title": str(rec["title"]), "director": sr.text(rec.get("director")),
            "cast": [str(c) for c in sr.as_list(rec.get("cast"))[:3]],
            "year": sr.year_of(rec.get("year")), "language": sr.text(rec.get("language")),
@@ -64,6 +67,9 @@ def _rec_row(rec):
     blurb = sr.short(rec.get("overview"))
     if blurb:
         out["blurb"] = blurb
+    aw = sr.award_note(b, rec.get("id")) if b else None
+    if aw:
+        out["awards"] = aw
     return out
 
 
@@ -124,7 +130,7 @@ def _tool_get_recommendations(state, anchor_titles=None, n=10, min_year=None, ma
         if why:
             avoided.append(f"{rec['title']} ({why})")
             continue
-        rows.append(_rec_row(rec))
+        rows.append(_rec_row(rec, b))
         if len(rows) >= n:
             break
 
@@ -381,6 +387,8 @@ Choose a path:
 **World cinema** ("Korean thrillers", "Bollywood"): set the language on get_recommendations or search_catalog_semantic.
 
 EXPLAINING PICKS: for get_recommendations results, the reasons are because_of, also_because and matched_tags; those are why the ranker chose the film. For search results, explain by the query, tags or person that found it. Describe a film only from its blurb, genres and tags. If a result has no blurb, don't summarise its plot from your own knowledge, even if you know the film well.
+
+AWARDS: a result may carry an `awards` field, taken from the catalogue's award data (Oscars, Emmys, Golden Globes, BAFTAs, festivals). You may mention it when it helps. Never state an award, win or nomination that is not in that field, even if you remember one.
 
 GROUNDING RULE — absolute:
 - Every film you name must appear, by title, in a tool result from THIS conversation. Never add a film from your own knowledge, however sure you are; run another search instead.

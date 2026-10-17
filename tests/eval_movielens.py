@@ -26,6 +26,12 @@ METHODS
   pop : top-K unrated by vote_count.
 
 MODES
+  ported book fixes (v3; the plan's 300 users x 3 folds, paired, bootstrap):
+      python tests\\eval_movielens.py --ml-dir path/to/ml-25m --port-fixes --users 300 --folds 3
+      Six configs x 300 users x 3 folds is long; smoke it first with
+      --users 50 --folds 1.
+  award bonus sweep (needs data/processed/film_awards.parquet):
+      python tests\\eval_movielens.py --ml-dir path/to/ml-25m --award-sweep --users 300 --folds 3
   evaluate (default):
       python eval_movielens.py --ml-dir path/to/ml-25m --users 300
   tune (grid-search on tune users, validate best config on unseen test users):
@@ -197,8 +203,26 @@ def split_user(ratings, rng):
     return train, test
 
 
+def split_user_folds(ratings, rng, folds):
+    """K-fold version of split_user: shuffle once, cut into K parts, each part
+    is the test set once. Same users and same seed -> same folds for every
+    config, so per-user scores stay paired across configs."""
+    idx = rng.permutation(len(ratings))
+    out = []
+    for part in np.array_split(idx, folds):
+        test_i = set(part.tolist())
+        out.append(([r for i, r in enumerate(ratings) if i not in test_i],
+                    [r for i, r in enumerate(ratings) if i in test_i]))
+    return out
+
+
 def eval_users(users, df, embeddings, index, tags_df, recommend_movies,
-               params=None, methods=("new", "old", "pop"), seed=SEED, label=""):
+               params=None, methods=("new", "old", "pop"), seed=SEED, label="",
+               folds=1):
+    """folds=1 is the original single 80/20 split (identical RNG draws, so old
+    numbers reproduce). folds=K scores each user K times, each fold held out
+    once, and averages -- one user still counts once in every mean, so the
+    paired comparison is per user exactly as before."""
     rng = np.random.default_rng(seed)
     vote_ok = dict(zip(df["id"].astype(str), df["vote_count"] >= MIN_VOTES))
     per_user = {m: {"r10": [], "r20": [], "r50": [], "hit20": []} for m in methods}
@@ -206,28 +230,37 @@ def eval_users(users, df, embeddings, index, tags_df, recommend_movies,
     skipped = 0
 
     for n_done, (uid, ratings) in enumerate(users.items(), 1):
-        train, test = split_user(ratings, rng)
-        relevant = {str(r["movie_id"]) for r in test
-                    if r["rating"] >= 4.0 and vote_ok.get(str(r["movie_id"]), False)}
-        if not relevant or not any(r["rating"] >= 3.5 for r in train):
+        splits = ([split_user(ratings, rng)] if folds <= 1
+                  else split_user_folds(ratings, rng, folds))
+        u = {m: {"r10": [], "r20": [], "r50": [], "hit20": []} for m in methods}
+        for train, test in splits:
+            relevant = {str(r["movie_id"]) for r in test
+                        if r["rating"] >= 4.0 and vote_ok.get(str(r["movie_id"]), False)}
+            if not relevant or not any(r["rating"] >= 3.5 for r in train):
+                continue
+
+            ranked = {}
+            if "new" in methods:
+                ranked["new"] = rank_new(train, df, embeddings, index, tags_df,
+                                         recommend_movies, params=params)
+            if "old" in methods:
+                ranked["old"] = rank_old_style(train, df, embeddings, index)
+            if "pop" in methods:
+                ranked["pop"] = rank_popularity(train, df)
+
+            for m, ids in ranked.items():
+                for K, key in ((10, "r10"), (20, "r20"), (50, "r50")):
+                    topk = set(ids[:K])
+                    u[m][key].append(len(relevant & topk) / len(relevant))
+                u[m]["hit20"].append(1.0 if relevant & set(ids[:20]) else 0.0)
+
+        if not u[methods[0]]["r20"]:
             skipped += 1
             continue
-
-        ranked = {}
-        if "new" in methods:
-            ranked["new"] = rank_new(train, df, embeddings, index, tags_df,
-                                     recommend_movies, params=params)
-        if "old" in methods:
-            ranked["old"] = rank_old_style(train, df, embeddings, index)
-        if "pop" in methods:
-            ranked["pop"] = rank_popularity(train, df)
-
         eval_uids.append(uid)
-        for m, ids in ranked.items():
-            for K, key in ((10, "r10"), (20, "r20"), (50, "r50")):
-                topk = set(ids[:K])
-                per_user[m][key].append(len(relevant & topk) / len(relevant))
-            per_user[m]["hit20"].append(1.0 if relevant & set(ids[:20]) else 0.0)
+        for m in methods:
+            for key in ("r10", "r20", "r50", "hit20"):
+                per_user[m][key].append(float(np.mean(u[m][key])))
 
         if n_done % 25 == 0:
             print(f"  {label}[{n_done}/{len(users)}] users evaluated...")
@@ -449,23 +482,82 @@ def paired_delta(base_row, var_row, key="r20"):
     return float(d.mean()), float(d.std(ddof=1) / np.sqrt(len(d))), len(d)
 
 
+def paired_bootstrap(base_row, var_row, key="r20", n_boot=10000, seed=SEED):
+    """95% range of mean(var - base) over users, resampling USERS with
+    replacement, plus the share of resamples where `var` is worse. Same method
+    as eval_goodbooks, so the two tabs' numbers read the same way."""
+    bu = {u: v for u, v in zip(base_row["_uids"], base_row["_raw"][key])}
+    vu = {u: v for u, v in zip(var_row["_uids"], var_row["_raw"][key])}
+    d = np.array([vu[u] - bu[u] for u in bu if u in vu], dtype=float)
+    if len(d) < 2:
+        return 0.0, 0.0, 0.5
+    rng = np.random.default_rng(seed)
+    means = d[rng.integers(0, len(d), size=(n_boot, len(d)))].mean(axis=1)
+    lo, hi = np.percentile(means, [2.5, 97.5])
+    return float(lo), float(hi), float((means < 0).mean())
+
+
 def print_paired(rows, base_name, key="r20"):
     base = dict(rows)[base_name]
     print(f"\nPAIRED vs '{base_name}' on {key} (same users, same splits)")
-    print("-" * 74)
-    print(f"{'variant':<26}{'delta':>10}{'± paired se':>14}{'t':>8}   verdict")
+    print("-" * 96)
+    print(f"{'variant':<26}{'delta':>10}{'± paired se':>14}{'t':>8}"
+          f"{'95% range (bootstrap)':>26}{'P(worse)':>10}")
     for name, row in rows:
         if name == base_name or "_raw" not in row:
             continue
         d, se, n = paired_delta(base, row, key)
         t = d / se if se else 0.0
-        verdict = "REAL" if abs(t) >= 2 else "noise"
-        print(f"{name:<26}{d:>+10.4f}{se:>14.4f}{t:>8.1f}   {verdict}")
-    print("-" * 74)
-    print("t = delta / paired stderr. |t| >= 2 is roughly the 95% threshold.")
-    print("Compare against the unpaired bars above: pairing usually shrinks the")
-    print("interval several-fold, because it stops charging between-user")
+        lo, hi, pw = paired_bootstrap(base, row, key)
+        flag = "  <<" if (lo > 0 or hi < 0) else ""
+        print(f"{name:<26}{d:>+10.4f}{se:>14.4f}{t:>8.1f}"
+              f"{f'[{lo:+.4f}, {hi:+.4f}]':>26}{pw:>9.0%}{flag}")
+    print("-" * 96)
+    print("t = delta / paired stderr. << = the bootstrap range excludes zero, a")
+    print("real difference. P(worse) = share of 10,000 user-resamples where the")
+    print("variant loses to the base. Pairing stops charging between-user")
     print("variance to a within-user comparison.")
+
+
+# Ported book-ranker fixes, each against the ranker as it shipped before them.
+# OLD pins all three switches off explicitly, so this base stays the pre-port
+# ranker even after the constants in app.py are flipped.
+PORT_OLD = {"neg_floor_k": 0, "sim_scale": 1.0, "tag_idf": 0.0}
+PORT_FIXES = [
+    ("shipped (all off)",        PORT_OLD),
+    ("floor only",               {**PORT_OLD, "neg_floor_k": 200}),
+    ("floor + sim x2",           {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 2.0}),
+    ("floor + sim x3",           {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0}),
+    ("floor + sim x5",           {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 5.0}),
+    ("floor + sim x3 + idf 1",   {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0,
+                                  "tag_idf": 1.0}),
+]
+
+
+def port_fixes(users, df, embeddings, index, tags_df, recommend_movies, folds):
+    print(f"\nPORTED BOOK FIXES on {len(users)} users, {folds}-fold. Same users, "
+          f"same seeded folds, so every row is paired with the first.\n")
+    rows = []
+    for name, params in PORT_FIXES:
+        s, n = eval_users(users, df, embeddings, index, tags_df,
+                          recommend_movies, params=params, methods=("new",),
+                          label=f"{name}: ", folds=folds)
+        rows.append((name, s["new"]))
+    print("\n" + "=" * 74)
+    print(f"{'config':<26}{'recall@10':>12}{'recall@20':>12}{'recall@50':>12}{'hit@20':>10}")
+    print("-" * 74)
+    for name, r in rows:
+        print(f"{name:<26}{r['r10'][0]:>12.4f}{r['r20'][0]:>12.4f}"
+              f"{r['r50'][0]:>12.4f}{r['hit20'][0]:>10.3f}")
+    print("=" * 74)
+    base = PORT_FIXES[0][0]
+    print_paired(rows, base, key="r20")
+    print_paired(rows, base, key="r50")
+    print("\nSHIP RULE (v3 plan): a config ships if its recall@20 range includes")
+    print("zero or sits above it, AND the titles on a real profile read better.")
+    print("Books took floor + sim x3; a different corpus can want a different")
+    print("stretch, which is why x2 and x5 are here. Then set MOVIE_NEG_FLOOR_K,")
+    print("MOVIE_SIM_SCALE and MOVIE_TAG_IDF at the top of app.py.")
 
 
 def ablate(users, df, embeddings, index, tags_df, recommend_movies):
@@ -503,6 +595,70 @@ def ablate(users, df, embeddings, index, tags_df, recommend_movies):
     print_paired(rows, base_name, key="hit20")
 
 
+# Award bonus sweep. Includes the original 0.25/0.5 proposal so it is measured
+# rather than argued about. Recall usually RISES with the weight on MovieLens,
+# because award winners are popular and the metric rewards popular guesses --
+# so the decision also reads the awarded share of the top 20.
+AWARD_SWEEP = [
+    ("no bonus",       0.0,  0.0),
+    ("0.04 / 0.02",    0.04, 0.02),
+    ("0.10 / 0.05",    0.10, 0.05),
+    ("0.25 / 0.125",   0.25, 0.125),
+    ("0.50 / 0.25",    0.50, 0.25),
+]
+
+
+def load_award_summaries(ns, art, kind_file="film_awards.parquet"):
+    path = art.get("AWARDS")
+    if path is None or not Path(path).exists():
+        sys.exit(f"no award file ({path or kind_file}). Run "
+                 f"notebooks/pipeline/build_screen_awards.py --stage build first.")
+    awards = ns["award_summaries"](pd.read_parquet(path))
+    major = sum(1 for a in awards.values() if a["major"])
+    print(f"awards loaded: {len(awards):,} films, {major:,} with a major award")
+    return awards
+
+
+def award_sweep(users, df, embeddings, index, tags_df, recommend_movies, folds, awards):
+    print(f"\nAWARD BONUS SWEEP on {len(users)} users, {folds}-fold. Same users, same "
+          f"seeded folds; every row paired with 'no bonus'.\n")
+    rows = []
+    for name, w, nm in AWARD_SWEEP:
+        params = {"awards": awards, "award_win": w, "award_nom": nm}
+        s, n = eval_users(users, df, embeddings, index, tags_df, recommend_movies,
+                          params=params, methods=("new",), label=f"{name}: ", folds=folds)
+        rows.append((name, s["new"]))
+
+    # What the lists turn into: share of each user's top 20 (whole profile)
+    # that carries a major award. This is the number that says whether the
+    # weight is a nudge or a takeover.
+    sample = list(users.items())[:100]
+    share = {}
+    for name, w, nm in AWARD_SWEEP:
+        vals = []
+        for uid, ratings in sample:
+            ids = rank_new(ratings, df, embeddings, index, tags_df, recommend_movies,
+                           params={"awards": awards, "award_win": w, "award_nom": nm}, k=20)
+            if ids:
+                vals.append(np.mean([bool(awards.get(int(i), {}).get("major")) for i in ids]))
+        share[name] = float(np.mean(vals)) if vals else 0.0
+
+    print("\n" + "=" * 86)
+    print(f"{'config':<18}{'recall@10':>12}{'recall@20':>12}{'recall@50':>12}{'hit@20':>10}"
+          f"{'award share of top 20':>22}")
+    print("-" * 86)
+    for name, r in rows:
+        print(f"{name:<18}{r['r10'][0]:>12.4f}{r['r20'][0]:>12.4f}{r['r50'][0]:>12.4f}"
+              f"{r['hit20'][0]:>10.3f}{share[name]:>21.0%}")
+    print("=" * 86)
+    print_paired(rows, AWARD_SWEEP[0][0], key="r20")
+    print("\nREAD BOTH COLUMNS. A weight that raises recall by turning half the")
+    print("list into famous award winners has bought familiarity, not taste --")
+    print("the same trap the popularity sweep documents. Ship the smallest weight")
+    print("that is not worse, set MOVIE_AWARD_WIN / MOVIE_AWARD_NOM in app.py,")
+    print("and read the real-profile titles before pushing.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ml-dir", required=True, help="folder containing ratings.csv and links.csv")
@@ -515,10 +671,19 @@ def main():
     ap.add_argument("--enrichment-cost", action="store_true",
                     help="measure what the runtime floor and kids filter cost "
                          "in recall, against the same users")
+    ap.add_argument("--port-fixes", action="store_true",
+                    help="A/B the floored dislike penalty, similarity stretch "
+                         "and tag IDF ported from the books ranker")
+    ap.add_argument("--award-sweep", action="store_true",
+                    help="sweep the award bonus (needs data/processed/film_awards.parquet)")
+    ap.add_argument("--folds", type=int, default=1,
+                    help="K-fold per user (each part held out once); 1 = the "
+                         "original single 80/20 split. Runtime scales with K.")
     ap.add_argument("--seed", type=int, default=SEED)
     args = ap.parse_args()
 
-    recommend_movies = load_app_functions(APP_PY)
+    ns = load_ranker(APP_PY)
+    recommend_movies = ns["recommend_movies"]
     print("loading corpus + artifacts...")
 
     # Follow app.py rather than the constants at the top of this file. A
@@ -547,7 +712,12 @@ def main():
         print(f"tags loaded: {tags_df.shape[0]:,} films")
 
     users, chosen = load_movielens(args.ml_dir, df, args.users, args.seed)
-    if args.pop_sweep:
+    if args.award_sweep:
+        awards = load_award_summaries(ns, art)
+        award_sweep(users, df, embeddings, index, tags_df, recommend_movies, args.folds, awards)
+    elif args.port_fixes:
+        port_fixes(users, df, embeddings, index, tags_df, recommend_movies, args.folds)
+    elif args.pop_sweep:
         pop_sweep(users, df, embeddings, index, tags_df, recommend_movies)
     elif args.enrichment_cost:
         enrichment_cost(users, df, embeddings, index, tags_df, recommend_movies)

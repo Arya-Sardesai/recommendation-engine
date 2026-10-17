@@ -40,6 +40,9 @@ def _row(b, pos):
     blurb = sr.short(r.get("overview"), 160)
     if blurb:
         out["blurb"] = blurb
+    aw = sr.award_note(b, r.get("tmdb_id"))
+    if aw:
+        out["awards"] = aw
     return out
 
 
@@ -61,6 +64,9 @@ def _rec_row(b, rec):
     blurb = sr.short(rec.get("overview"))
     if blurb:
         out["blurb"] = blurb
+    aw = sr.award_note(b, rec.get("tmdb_id"))
+    if aw:
+        out["awards"] = aw
     return out
 
 
@@ -281,6 +287,8 @@ Choose a path:
 **Path C — theme or format** ("a limited series about a con", "a long sitcom to live in"): search_by_tags. Format tags (miniseries, sitcom, telenovela) are the right tool for length requests. For pace or mood ("slow-burn", "atmospheric"), use search_catalog_semantic instead.
 
 EXPLAINING PICKS: for get_recommendations results, the reasons are because_of, also_because and matched_tags; those are why the ranker chose the series. Use seasons and network too. For search results, explain by the query or tags that found it. Describe a series only from its blurb, genres and tags. If a result has no blurb, don't summarise its plot from your own knowledge, even if you know the show well.
+
+AWARDS: a result may carry an `awards` field, taken from the catalogue's award data (Oscars, Emmys, Golden Globes, BAFTAs, festivals). You may mention it when it helps. Never state an award, win or nomination that is not in that field, even if you remember one.
 
 GROUNDING RULE — absolute:
 - Every series you name must appear, by name, in a tool result from THIS conversation. Never add one from your own knowledge, however sure you are; run another search instead. That includes spin-offs and sequels: verify with search_catalog or describe without naming.

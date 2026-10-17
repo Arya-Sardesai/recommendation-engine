@@ -21,6 +21,11 @@ v6: LIVE is now DERIVED from the deployed app.py's B_/M_/T_ constants instead
     and staying silent on real ones. A stale safety prompt is worse than none,
     because it trains you to hit y.
     Also adds movies_v2_meta.parquet (runtime + certification + cert_tier).
+v7: adds the award files (film_awards.parquet, tv_awards.parquet, from
+    notebooks/pipeline/build_screen_awards.py) and book_forms_v3.parquet (the
+    shelf gate's fiction/non-fiction labels, never uploaded until now). All
+    three are named in app.py (M_AWARDS, T_AWARDS, B_FORMS), so they are LIVE
+    the moment they land: badges appear, and the shelf gate switches on.
 """
 import re
 import sys
@@ -108,6 +113,14 @@ FILES = [
     # asserts row order and refuses to write if it shifted. Upload this alone,
     # confirm it is serving, then flip M_CORPUS.
     "movies_v2_meta.parquet",
+    # --- v3 additions ---
+    # Award badges + (switched-off) award bonus. A missing file = no badges, so
+    # these can go up before or after app.py is pushed.
+    "film_awards.parquet",
+    "tv_awards.parquet",
+    # Shelf gate labels. Uploading this turns the gate ON for the live Books tab
+    # (app.py already passes forms= to recommend_books).
+    "book_forms_v3.parquet",
     # --- tv ---
     # "tv_corpus.parquet",
     # "tv_tags.parquet",                    # keyword-derived, 49.9% coverage

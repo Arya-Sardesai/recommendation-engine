@@ -53,6 +53,11 @@ OUT = RAW_DIR / "gbooks_raw.jsonl"
 
 API = "https://www.googleapis.com/books/v1/volumes"
 MIN_DESC_CHARS = 100          # same bar the harvest used
+# Oct 12 peek at the queue: the under-25-reader band was 61% of it and mostly
+# series filler (LitRPG, romantasy), and many of those books sit under the
+# app's 10-rating serving floor, so they could never be recommended anyway.
+# 25+ keeps ~10.9K books: the classics, non-fiction and older literary fiction.
+MIN_READERS = 25
 STRATA = [(0, 25), (25, 100), (100, 500), (500, 2000), (2000, 10 ** 9)]
 
 
@@ -87,7 +92,7 @@ def book_key(title, author):
     return (ct, ca) if ct and ca else None
 
 
-def build_targets():
+def build_targets(min_readers=MIN_READERS):
     """Every raw.jsonl book that is NOT already servable, deduplicated.
 
     Three cross-references, so quota is only spent on books that are really
@@ -137,6 +142,9 @@ def build_targets():
                 continue
             if k in have_keys:
                 skip["already in corpus (other record)"] += 1
+                continue
+            if int(b.get("users_count") or 0) < min_readers:
+                skip[f"under {min_readers} readers"] += 1
                 continue
             row = {"id": bid, "title": title, "author": author,
                    "users_count": int(b.get("users_count") or 0)}
@@ -446,6 +454,9 @@ def main():
     ap.add_argument("--probe", nargs=2, metavar=("TITLE", "AUTHOR"),
                     help="show what each query form returns for one book (~4 calls)")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--min-readers", type=int, default=MIN_READERS,
+                    help="only queue books with at least this many Hardcover readers "
+                         f"(default {MIN_READERS}; used by --rebuild-targets)")
     ap.add_argument("--rebuild-targets", action="store_true",
                     help="rebuild the target list (keeps everything already fetched)")
     args = ap.parse_args()
@@ -453,7 +464,7 @@ def main():
         probe(*args.probe)
         return
     if args.rebuild_targets:
-        build_targets()
+        build_targets(args.min_readers)
         return
     if args.report:
         report()

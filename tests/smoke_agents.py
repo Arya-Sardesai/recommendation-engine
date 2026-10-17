@@ -79,9 +79,9 @@ def space_call(kind, b, ratings, skipped):
                                      n=20, skip_ids=skipped, forms=b["forms"])
     if kind == "movie":
         return ns["recommend_movies"](ratings, b["df"], b["emb"], b["index"], tags_df=b["tags"],
-                                      n=20, skip_ids=skipped)
+                                      n=20, skip_ids=skipped, awards=b["awards"])
     return ns["recommend_tv"](ratings, b["df"], b["emb"], b["index"], tags_df=b["tags"],
-                              n=20, skip_ids=skipped)
+                              n=20, skip_ids=skipped, awards=b["awards"])
 
 
 def count(res):
@@ -120,6 +120,10 @@ def main():
         print(f"  servable {int(b['servable'].sum()):,} of {len(b['df']):,}")
         tagged = len(b["tags"]) if b["tags"] is not None else 0
         print(f"  tags     {tagged:,} tagged")
+        if kind != "book":
+            aw = b.get("awards") or {}
+            print(f"  awards   {len(aw):,} titles with an award "
+                  f"({sum(1 for a in aw.values() if a['major']):,} major)")
         print(f"  call     literal={b['call_literal']}  keywords={sorted(b['call_keywords'])}")
         if b["call_problems"]:
             print(f"  FAIL call: {b['call_problems']}")
