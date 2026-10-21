@@ -519,18 +519,22 @@ def print_paired(rows, base_name, key="r20"):
     print("variance to a within-user comparison.")
 
 
-# Ported book-ranker fixes, each against the ranker as it shipped before them.
-# OLD pins all three switches off explicitly, so this base stays the pre-port
-# ranker even after the constants in app.py are flipped.
+# ROUND 2 (Oct 17). Round 1 (50 MovieLens users, 1 fold) showed the stretch
+# that won on books LOSES on films: floor + sim x3 was -0.011 recall@20 and
+# -0.028 recall@50 (range excluding zero), x5 the same, x3 + idf the same;
+# floor only was +0.008 (t 1.2); x2 tied. TV leave-one-out pointed the same
+# way. Likely reason: on films the signals the stretch drowns out (Bayesian
+# quality prior, cross-pollination) are the GOOD ones -- the opposite of books,
+# where tags and the prior were what dragged in the wrong picks.
+# Round 2 drops the losers and asks what round 1 left open: is the floor real,
+# does tag IDF help without the stretch, does a much gentler stretch help.
 PORT_OLD = {"neg_floor_k": 0, "sim_scale": 1.0, "tag_idf": 0.0}
 PORT_FIXES = [
-    ("shipped (all off)",        PORT_OLD),
-    ("floor only",               {**PORT_OLD, "neg_floor_k": 200}),
-    ("floor + sim x2",           {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 2.0}),
-    ("floor + sim x3",           {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0}),
-    ("floor + sim x5",           {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 5.0}),
-    ("floor + sim x3 + idf 1",   {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0,
-                                  "tag_idf": 1.0}),
+    ("shipped (all off)",  PORT_OLD),
+    ("floor only",         {**PORT_OLD, "neg_floor_k": 200}),
+    ("floor + idf 1",      {**PORT_OLD, "neg_floor_k": 200, "tag_idf": 1.0}),
+    ("floor + sim x1.5",   {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 1.5}),
+    ("floor + sim x2",     {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 2.0}),
 ]
 
 
@@ -555,8 +559,8 @@ def port_fixes(users, df, embeddings, index, tags_df, recommend_movies, folds):
     print_paired(rows, base, key="r50")
     print("\nSHIP RULE (v3 plan): a config ships if its recall@20 range includes")
     print("zero or sits above it, AND the titles on a real profile read better.")
-    print("Books took floor + sim x3; a different corpus can want a different")
-    print("stretch, which is why x2 and x5 are here. Then set MOVIE_NEG_FLOOR_K,")
+    print("Round 1 already ruled out sim x3 and x5 on films (see the ROUND 2 note).")
+    print("Then set MOVIE_NEG_FLOOR_K,")
     print("MOVIE_SIM_SCALE and MOVIE_TAG_IDF at the top of app.py.")
 
 

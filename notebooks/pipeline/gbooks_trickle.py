@@ -32,6 +32,7 @@ USAGE (repo root)
     $env:GOOGLE_BOOKS_KEY = "your_key"
     python notebooks\\pipeline\\gbooks_trickle.py            # one day's batch
     python notebooks\\pipeline\\gbooks_trickle.py --report
+    python notebooks\\pipeline\\gbooks_trickle.py --retry-empty   # once the queue is done
 """
 import argparse
 import json
@@ -190,8 +191,13 @@ def _clean_title(title):
     return re.sub(r"\s+", " ", t).strip()
 
 
+_SUFFIX = {"jr", "sr", "ii", "iii", "iv", "phd", "md"}
+
+
 def _surname(author):
-    toks = [w for w in re.split(r"[\s.]+", str(author)) if len(w) > 1]
+    # "Henry S. Warren Jr." -> Warren, not Jr (Oct 21 audit)
+    toks = [w for w in re.split(r"[\s.,]+", str(author)) if len(w) > 1]
+    toks = [w for w in toks if w.lower() not in _SUFFIX] or toks
     return toks[-1] if toks else str(author)
 
 
@@ -213,6 +219,15 @@ def query_variants(title, author):
     ct, sn = _clean_title(title), _surname(author)
     return [f'{ct} {author}',
             f'intitle:{ct} inauthor:{sn}']
+
+
+def retry_variants(title, author):
+    """For --retry-empty: books where BOTH normal searches came back empty.
+    Some were Google's silent empties (You Killed Me First, John Marrs -- Google
+    has it), so the plain search is asked once more; then title + SURNAME only
+    ("Henry S. Warren Jr." vs "Henry S. Warren"); then the title alone."""
+    ct, sn = _clean_title(title), _surname(author)
+    return list(dict.fromkeys([f'{ct} {author}', f'{ct} {sn}', f'intitle:{ct}']))
 
 
 RETRY_WAITS = (15, 30, 60, 120)     # seconds; ~4 minutes total before giving up
@@ -308,7 +323,7 @@ def slim(item):
             "description": vi.get("description")}
 
 
-def run(max_n, pause):
+def run(max_n, pause, retry_empty=False):
     key = os.environ.get("GOOGLE_BOOKS_KEY")
     if not key:
         sys.exit('GOOGLE_BOOKS_KEY not set. Run: $env:GOOGLE_BOOKS_KEY = "your_key"')
@@ -323,9 +338,23 @@ def run(max_n, pause):
     tids = {t["id"] for t in targets}
     # only v2 rows count as done: v1 rows (full-title exact-phrase query)
     # returned 0 volumes for books Google certainly has, so they are redone
-    done = {r["id"] for r in load_jsonl(OUT) if r.get("v") == 2} & tids
-    todo = [t for t in targets if t["id"] not in done]
-    print(f"{len(done):,} done | {len(todo):,} left | this budget: {max_n} calls")
+    rows_out = load_jsonl(OUT)
+    done = {r["id"] for r in rows_out if r.get("v") == 2} & tids
+    variants = query_variants
+    if retry_empty:
+        # latest v2 answer per book; retry the ones with no items, once
+        last = {}
+        for r in rows_out:
+            if r.get("v") == 2:
+                last[r["id"]] = r
+        todo = [t for t in targets if t["id"] in last
+                and not last[t["id"]].get("items") and not last[t["id"]].get("retry")]
+        variants = retry_variants
+        print(f"--retry-empty: {len(todo):,} books came back empty and have not been "
+              f"retried | this budget: {max_n} calls")
+    else:
+        todo = [t for t in targets if t["id"] not in done]
+        print(f"{len(done):,} done | {len(todo):,} left | this budget: {max_n} calls")
 
     calls = n = hits = errs = 0
     empties = []          # held back until the next canary passes
@@ -335,7 +364,7 @@ def run(max_n, pause):
             if calls >= max_n or stop:
                 break
             items, used = [], []
-            for q in query_variants(t["title"], t["author"]):
+            for q in variants(t["title"], t["author"]):
                 if calls >= max_n:
                     break
                 try:
@@ -378,10 +407,12 @@ def run(max_n, pause):
                     break
             if stop and not is_hit({"author": t["author"], "items": items}):
                 break     # budget hit mid-book: redo it fully next time
-            if (len(used) < len(query_variants(t["title"], t["author"]))
+            if (len(used) < len(variants(t["title"], t["author"]))
                     and not is_hit({"author": t["author"], "items": items})):
                 continue      # ran out of budget mid-book; redo it next time
             row = {**t, "v": 2, "queries": used, "items": items}
+            if retry_empty:
+                row["retry"] = 1     # written even if still empty: never retried twice
             if items:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
                 fh.flush()
@@ -415,10 +446,15 @@ def run(max_n, pause):
 
 def report():
     allrows = load_jsonl(OUT)
-    rows = [r for r in allrows if r.get("v") == 2]
+    latest = {}
+    for r in allrows:
+        if r.get("v") == 2:
+            latest[r["id"]] = r      # a --retry-empty row replaces the empty one
+    rows = list(latest.values())
     targets = load_jsonl(TARGETS)
-    if len(allrows) > len(rows):
-        print(f"({len(allrows) - len(rows):,} old v1 lookups ignored -- they are redone)")
+    old = sum(1 for r in allrows if r.get("v") != 2)
+    if old:
+        print(f"({old:,} old v1 lookups ignored -- they are redone)")
     if not rows:
         sys.exit("no v2 lookups yet")
     print(f"{len(rows):,} of {len(targets):,} looked up\n")
@@ -454,6 +490,9 @@ def main():
     ap.add_argument("--probe", nargs=2, metavar=("TITLE", "AUTHOR"),
                     help="show what each query form returns for one book (~4 calls)")
     ap.add_argument("--report", action="store_true")
+    ap.add_argument("--retry-empty", action="store_true",
+                    help="search again, once, for books whose normal searches came back "
+                         "empty (other query forms; uses the --max budget)")
     ap.add_argument("--min-readers", type=int, default=MIN_READERS,
                     help="only queue books with at least this many Hardcover readers "
                          f"(default {MIN_READERS}; used by --rebuild-targets)")
@@ -469,7 +508,7 @@ def main():
     if args.report:
         report()
     else:
-        run(args.max, args.pause)
+        run(args.max, args.pause, args.retry_empty)
 
 
 if __name__ == "__main__":

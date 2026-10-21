@@ -41,6 +41,7 @@ USAGE
     python tests\\eval_tv_loo.py tests\\movies_ratings.json --ablate
     python tests\\eval_tv_loo.py tests\\movies_ratings.json --ablate --max-k 50
     python tests\\eval_tv_loo.py tests\\movies_ratings.json --port-fixes
+    python tests\\eval_tv_loo.py $HOME\\Downloads\\my-recommendation-profile.json --port-fixes
 """
 import argparse
 import json
@@ -74,18 +75,22 @@ ABLATIONS = [
 ]
 
 
-# Ported book-ranker fixes, each against the ranker as it shipped before them.
-# PORT_OLD pins the switches off so the base stays the pre-port ranker even
-# after the TV_* constants in app.py are flipped.
+# ROUND 2 (Oct 17). Round 1 (50 MovieLens users, 1 fold) showed the stretch
+# that won on books LOSES on films: floor + sim x3 was -0.011 recall@20 and
+# -0.028 recall@50 (range excluding zero), x5 the same, x3 + idf the same;
+# floor only was +0.008 (t 1.2); x2 tied. TV leave-one-out pointed the same
+# way. Likely reason: on films the signals the stretch drowns out (Bayesian
+# quality prior, cross-pollination) are the GOOD ones -- the opposite of books,
+# where tags and the prior were what dragged in the wrong picks.
+# Round 2 drops the losers and asks what round 1 left open: is the floor real,
+# does tag IDF help without the stretch, does a much gentler stretch help.
 PORT_OLD = {"neg_floor_k": 0, "sim_scale": 1.0, "tag_idf": 0.0}
 PORT_FIXES = [
-    ("shipped (all off)",      PORT_OLD),
-    ("floor only",             {**PORT_OLD, "neg_floor_k": 200}),
-    ("floor + sim x2",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 2.0}),
-    ("floor + sim x3",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0}),
-    ("floor + sim x5",         {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 5.0}),
-    ("floor + sim x3 + idf 1", {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 3.0,
-                                "tag_idf": 1.0}),
+    ("shipped (all off)",  PORT_OLD),
+    ("floor only",         {**PORT_OLD, "neg_floor_k": 200}),
+    ("floor + idf 1",      {**PORT_OLD, "neg_floor_k": 200, "tag_idf": 1.0}),
+    ("floor + sim x1.5",   {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 1.5}),
+    ("floor + sim x2",     {**PORT_OLD, "neg_floor_k": 200, "sim_scale": 2.0}),
 ]
 
 
@@ -112,7 +117,11 @@ def bootstrap_rr(base_ranks, other_ranks, n_boot=10000, seed=17):
 
 
 def load_tv_ratings(path):
+    """Accepts the website's 'Export profile' file (my-recommendation-profile.json,
+    ratings under data.tv_ratings), the old ?debug=1 blob (re_tv), or a bare list."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and isinstance(raw.get("data"), dict):
+        return list(raw["data"].get("tv_ratings") or [])
     if isinstance(raw, dict):
         v = raw.get("re_tv")
         if isinstance(v, str):
