@@ -21,6 +21,8 @@ v6: LIVE is now DERIVED from the deployed app.py's B_/M_/T_ constants instead
     and staying silent on real ones. A stale safety prompt is worse than none,
     because it trains you to hit y.
     Also adds movies_v2_meta.parquet (runtime + certification + cert_tier).
+v8: content_warnings.parquet, and X_ constants (shared, all-tab files like
+    X_WARNINGS) now count as LIVE too.
 v7: adds the award files (film_awards.parquet, tv_awards.parquet, from
     notebooks/pipeline/build_screen_awards.py) and book_forms_v3.parquet (the
     shelf gate's fiction/non-fiction labels, never uploaded until now). All
@@ -71,7 +73,7 @@ def derive_live():
     live = set()
     # B_CORPUS = "books_v2_hc.parquet"   /   M_FAISS = 'movie_faiss_....index'
     pattern = re.compile(
-        r'^\s*(?:B_|M_|T_)[A-Z0-9_]*\s*=\s*["\']([^"\']+\.(?:parquet|npy|index))["\']',
+        r'^\s*(?:B_|M_|T_|X_)[A-Z0-9_]*\s*=\s*["\']([^"\']+\.(?:parquet|npy|index))["\']',
         re.MULTILINE)
     for m in pattern.finditer(src):
         live.add(m.group(1))
@@ -121,6 +123,10 @@ FILES = [
     # Shelf gate labels. Uploading this turns the gate ON for the live Books tab
     # (app.py already passes forms= to recommend_books).
     "book_forms_v3.parquet",
+    # "May contain" lines on the cards (X_WARNINGS in app.py, built by
+    # notebooks/pipeline/build_content_warnings.py). Display only; a missing
+    # file = no lines, so it can go up before or after app.py.
+    "content_warnings.parquet",
     # --- tv ---
     # "tv_corpus.parquet",
     # "tv_tags.parquet",                    # keyword-derived, 49.9% coverage

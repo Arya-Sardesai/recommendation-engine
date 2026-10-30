@@ -176,7 +176,8 @@ def _servable_mask(kind, df, ns):
         rc = _num(df, "ratings_count").fillna(0)
         ok = rc >= d["min_ratings"]
         if "source" in df.columns:
-            ok |= df["source"].astype(str).eq("targeted_authors")
+            ok |= df["source"].astype(str).isin(
+                ns.get("CURATED_SOURCES", {"targeted_authors"}))
         if "average_rating" in df.columns:
             ar = _num(df, "average_rating")
             c = ar[rc >= d["min_ratings"]].mean()

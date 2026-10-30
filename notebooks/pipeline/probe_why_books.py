@@ -107,13 +107,16 @@ def explain_score(ns, ratings, df, emb, index, tags_df, a, ai,
     glob = (np.array(tv, dtype="float32") * tw[:, None]).sum(0) / np.abs(tw).sum()
     prof = glob
     abid = str(a["book_id"])
-    if mix and abid in tags_df.index:
+    if abid in tags_df.index:
         at = tags_df.loc[abid].values.astype("float32")
-        prof = (1 - mix) * glob / np.linalg.norm(glob) + mix * at / np.linalg.norm(at)
+        if mix:
+            prof = (1 - mix) * glob / np.linalg.norm(glob) + mix * at / np.linalg.norm(at)
         print(f"\n  anchor's own top tags: "
-              f"{', '.join(pd.Series(at, index=cols).nlargest(6).index)}")
+              f"{', '.join(pd.Series(at, index=cols).nlargest(6).index)}"
+              f"{'' if mix else '   (per-anchor mix is 0: candidates are judged on the GLOBAL profile)'}")
     else:
-        print("\n  anchor has NO tags -> per-anchor mix falls back to the global profile")
+        print("\n  anchor has NO tags -> judged on the global profile "
+              "(BOOK_UNTAGGED_ANCHOR_TAGS scales that term)")
 
     def tsim(p, bid):
         if bid not in tags_df.index:

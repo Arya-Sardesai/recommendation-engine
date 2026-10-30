@@ -608,6 +608,39 @@ def run_award_sweep(users, df, emb, index, tags_df, rec, links, pos, base_params
     print("award, every row ties by construction -- that is coverage, not a verdict.")
 
 
+CAP_SWEEP = [("cap 3 (shipped)", 3), ("cap 2", 2), ("cap 1", 1)]
+
+
+def run_cap_sweep(users, df, emb, index, tags_df, rec, links, pos, base_params, folds, awards):
+    """Picks per liked rating, paired, award bonus on as shipped."""
+    rows, per = [], {}
+    for name, cap in CAP_SWEEP:
+        merged = dict(base_params)
+        merged["per_anchor_cap"] = cap
+        if awards:
+            merged["awards"] = awards
+        print(f"\nrunning: {name}")
+        s, _ = eval_users(users, df, emb, index, tags_df, rec, links, pos,
+                          params=merged, label=f"{name}: ", folds=folds)
+        per[name] = s.pop("_per_user")
+        rows.append((name, s))
+    base = CAP_SWEEP[0][0]
+    print("\n" + "=" * 100)
+    print(f"{'config':<18}{'recall@20':>13}{'recall@50':>13}{'d r@20':>10}"
+          f"{'95% range (bootstrap)':>26}{'P(worse)':>10}")
+    print("-" * 100)
+    for name, r in rows:
+        line = (f"{name:<18}{r['r20'][0]:>8.4f}±{r['r20'][1]:<4.3f}"
+                f"{r['r50'][0]:>8.4f}±{r['r50'][1]:<4.3f}")
+        if name != base:
+            d, lo, hi, pw = paired_bootstrap(per[base][20], per[name][20])
+            flag = "  <<" if (lo > 0 or hi < 0) else ""
+            line += f"{d:>+10.4f}{f'[{lo:+.4f}, {hi:+.4f}]':>26}{pw:>9.0%}{flag}"
+        print(line)
+    print("=" * 100)
+    print("Paired vs cap 3; positive = better. Then set TV_PER_ANCHOR_CAP in app.py.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mal-dir", required=True)
@@ -626,6 +659,8 @@ def main():
                     help="K-fold per user; 1 = the original single 70/30 split")
     ap.add_argument("--award-sweep", action="store_true",
                     help="sweep the award bonus (needs data/processed/tv_awards.parquet)")
+    ap.add_argument("--cap-sweep", action="store_true",
+                    help="picks per liked rating: 3 (shipped) vs 2 vs 1")
     args = ap.parse_args()
 
     if args.stage == "inspect":
@@ -672,6 +707,13 @@ def main():
           else "SCORING ONLY (suppressors and serving floor lifted)")
 
     rec = ns["recommend_tv"]
+    if args.cap_sweep:
+        apath = art.get("AWARDS")
+        awards = (ns["award_summaries"](pd.read_parquet(apath))
+                  if apath is not None and Path(apath).exists() else None)
+        run_cap_sweep(users, df, emb, index, tags_df, rec, links, pos, base,
+                      args.folds, awards)
+        return
     if args.award_sweep:
         apath = art.get("AWARDS")
         if apath is None or not Path(apath).exists():

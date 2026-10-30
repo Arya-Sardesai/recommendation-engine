@@ -20,7 +20,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
-import space_ranker as sr  # noqa: E402
+import src.space_ranker as sr  # noqa: E402
 
 
 def _parse_set(items):

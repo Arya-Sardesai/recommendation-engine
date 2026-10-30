@@ -65,7 +65,11 @@ PROCESSED = Path("data/processed")
 RAW_DIR = Path("data/raw/movies/metadata_v1")
 RAW_PATH = RAW_DIR / "meta_raw.jsonl"
 IN_PARQUET = PROCESSED / "movies.parquet"
-OUT_PARQUET = PROCESSED / "movies_v2_meta.parquet"
+# Nov 2026: v3. movies_v2_meta.parquet is the name the LIVE Space reads
+# (M_CORPUS). Writing the expanded corpus under it and uploading would give the
+# Space more rows than vectors -- a new film rated by anyone crashes the tab
+# ("key < ntotal"). A new name keeps every upload inert until app.py flips.
+OUT_PARQUET = PROCESSED / "movies_v3_meta.parquet"
 
 MIN_VOTES = 400          # matches recommend_movies; below this nothing surfaces
 SLEEP = 0.03             # ~33 req/s, under TMDB's limit

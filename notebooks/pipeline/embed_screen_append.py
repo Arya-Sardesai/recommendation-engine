@@ -52,7 +52,7 @@ PROCESSED = Path("data/processed")
 CONFIG = {
     "movie": {
         "module": "embed_movies",
-        "corpus": PROCESSED / "movies_v2_meta.parquet",
+        "corpus": PROCESSED / "movies_v3_meta.parquet",     # Nov 2026 (was v2_meta)
         "old_emb": PROCESSED / "movie_embeddings_bgem3_v2_kw2.npy",
         "emb_fmt": "movie_embeddings_bgem3_{tag}.npy",
         "faiss_fmt": "movie_faiss_bgem3_{tag}.index",
@@ -60,7 +60,7 @@ CONFIG = {
     },
     "tv": {
         "module": "embed_tv",
-        "corpus": PROCESSED / "tv_v2_meta.parquet",
+        "corpus": PROCESSED / "tv_v3_meta.parquet",         # Nov 2026 (was v2_meta)
         "old_emb": PROCESSED / "tv_embeddings_bgem3_v2_kw_notitle.npy",
         "emb_fmt": "tv_embeddings_bgem3_{tag}.npy",
         "faiss_fmt": "tv_faiss_bgem3_{tag}.index",

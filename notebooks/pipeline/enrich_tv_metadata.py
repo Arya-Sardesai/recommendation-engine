@@ -61,7 +61,9 @@ PROCESSED = Path("data/processed")
 RAW_DIR = Path("data/raw/tv/metadata_v1")
 RAW_PATH = RAW_DIR / "tv_meta_raw.jsonl"
 IN_PARQUET = PROCESSED / "tv_corpus.parquet"
-OUT_PARQUET = PROCESSED / "tv_v2_meta.parquet"
+# Nov 2026: v3 -- tv_v2_meta.parquet is the LIVE name (T_CORPUS); see
+# enrich_movies_metadata.py for why the expanded corpus needs a new one.
+OUT_PARQUET = PROCESSED / "tv_v3_meta.parquet"
 
 MIN_VOTES = 300          # matches recommend_tv; below this nothing surfaces
 SLEEP = 0.03

@@ -32,6 +32,7 @@ MODES
       --users 50 --folds 1.
   award bonus sweep (needs data/processed/film_awards.parquet):
       python tests\\eval_movielens.py --ml-dir path/to/ml-25m --award-sweep --users 300 --folds 3
+      python tests\\eval_movielens.py --ml-dir path/to/ml-25m --cap-sweep --users 300 --folds 3
   evaluate (default):
       python eval_movielens.py --ml-dir path/to/ml-25m --users 300
   tune (grid-search on tune users, validate best config on unseen test users):
@@ -564,6 +565,36 @@ def port_fixes(users, df, embeddings, index, tags_df, recommend_movies, folds):
     print("MOVIE_SIM_SCALE and MOVIE_TAG_IDF at the top of app.py.")
 
 
+# Picks per liked rating (Oct 22). Arya's export: 20 "For you" films rest on 7
+# of his 93 liked films, 3 each. Fewer per rating spreads the list over more
+# of the profile. Award bonus on, as shipped.
+CAP_SWEEP = [("cap 3 (shipped)", 3), ("cap 2", 2), ("cap 1", 1)]
+
+
+def cap_sweep(users, df, embeddings, index, tags_df, recommend_movies, folds, awards):
+    print(f"\nPICKS PER RATING on {len(users)} users, {folds}-fold, paired.\n")
+    rows = []
+    for name, cap in CAP_SWEEP:
+        params = {"per_anchor_cap": cap}
+        if awards:
+            params["awards"] = awards
+        s, n = eval_users(users, df, embeddings, index, tags_df, recommend_movies,
+                          params=params, methods=("new",), label=f"{name}: ", folds=folds)
+        rows.append((name, s["new"]))
+    print("\n" + "=" * 74)
+    print(f"{'config':<26}{'recall@10':>12}{'recall@20':>12}{'recall@50':>12}{'hit@20':>10}")
+    print("-" * 74)
+    for name, r in rows:
+        print(f"{name:<26}{r['r10'][0]:>12.4f}{r['r20'][0]:>12.4f}"
+              f"{r['r50'][0]:>12.4f}{r['hit20'][0]:>10.3f}")
+    print("=" * 74)
+    print_paired(rows, CAP_SWEEP[0][0], key="r20")
+    print_paired(rows, CAP_SWEEP[0][0], key="r50")
+    print("\nShip rule as before: range includes zero or sits above it, AND the")
+    print("list reads better (compare_lists --set per_anchor_cap=2). Then set")
+    print("MOVIE_PER_ANCHOR_CAP in app.py.")
+
+
 def ablate(users, df, embeddings, index, tags_df, recommend_movies):
     print(f"\nABLATION on {len(users)} users — one component off per row; same "
           f"users, same splits (seeded), so rows are directly comparable.\n")
@@ -680,6 +711,8 @@ def main():
                          "and tag IDF ported from the books ranker")
     ap.add_argument("--award-sweep", action="store_true",
                     help="sweep the award bonus (needs data/processed/film_awards.parquet)")
+    ap.add_argument("--cap-sweep", action="store_true",
+                    help="picks per liked rating: 3 (shipped) vs 2 vs 1")
     ap.add_argument("--folds", type=int, default=1,
                     help="K-fold per user (each part held out once); 1 = the "
                          "original single 80/20 split. Runtime scales with K.")
@@ -716,7 +749,14 @@ def main():
         print(f"tags loaded: {tags_df.shape[0]:,} films")
 
     users, chosen = load_movielens(args.ml_dir, df, args.users, args.seed)
-    if args.award_sweep:
+    if args.cap_sweep:
+        try:
+            awards = load_award_summaries(ns, art)
+        except (Exception, SystemExit) as e:
+            print(f"  (no awards for the cap sweep: {e})")
+            awards = None
+        cap_sweep(users, df, embeddings, index, tags_df, recommend_movies, args.folds, awards)
+    elif args.award_sweep:
         awards = load_award_summaries(ns, art)
         award_sweep(users, df, embeddings, index, tags_df, recommend_movies, args.folds, awards)
     elif args.port_fixes:

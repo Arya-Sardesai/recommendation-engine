@@ -36,16 +36,22 @@ sys.path.insert(0, str(HERE))
 import embed_books as EB  # noqa: E402  — the source of truth for the recipe
 
 PROCESSED = Path("data/processed")
-NEW_CORPUS = PROCESSED / "books_v2_hc3.parquet"
-OLD_EMB = PROCESSED / "book_embeddings_bgem3_v2_hc2_notitle.npy"   # the LIVE vectors
-OUT_EMB = PROCESSED / "book_embeddings_bgem3_v2_hc3_notitle.npy"
-OUT_FAISS = PROCESSED / "book_faiss_bgem3_v2_hc3_notitle.index"
+# Nov 2026: hc3 (live) -> hc4 (merge_new_books.py: Google-blurb + award books).
+# Next time, move each name up one: OLD_EMB = the live vectors, the rest new.
+NEW_CORPUS = PROCESSED / "books_v2_hc4.parquet"
+OLD_EMB = PROCESSED / "book_embeddings_bgem3_v2_hc3_notitle.npy"   # the LIVE vectors
+OUT_EMB = PROCESSED / "book_embeddings_bgem3_v2_hc4_notitle.npy"
+OUT_FAISS = PROCESSED / "book_faiss_bgem3_v2_hc4_notitle.index"
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true",
                     help="show the embed texts and stop before loading the model")
+    # 1,000 was the sweep's size. The November merge is ~10,000 rows: still an
+    # append (existing rows untouched), just a bigger one -- ~10 min on the 4060.
+    ap.add_argument("--max-new", type=int, default=20000,
+                    help="refuse above this; more is a rebuild, not an append")
     args = ap.parse_args()
 
     df = pd.read_parquet(NEW_CORPUS)
@@ -57,8 +63,8 @@ def main():
     print(f"to embed         : {n_new}")
     if n_new <= 0:
         raise SystemExit("nothing to embed — corpus is not longer than the .npy")
-    if n_new > 1000:
-        raise SystemExit(f"{n_new} new rows is more than an append; use "
+    if n_new > args.max_new:
+        raise SystemExit(f"{n_new} new rows is beyond --max-new={args.max_new}; use "
                          f"embed_books.py for a full rebuild")
 
     new_rows = df.iloc[start:].reset_index(drop=True)
@@ -87,6 +93,9 @@ def main():
     model = SentenceTransformer(EB.MODEL_NAME, device="cuda")
     model.max_seq_length = EB.MAX_SEQ_LEN
 
+    # same precision as the live vectors: embed_books.py encoded them in fp16
+    if EB.USE_FP16:
+        model.half()
     vecs = model.encode(
         texts, batch_size=EB.ENCODE_BATCH, show_progress_bar=True,
         convert_to_numpy=True, normalize_embeddings=True,
@@ -124,8 +133,8 @@ def main():
         "a probed row did not self-match — index is misaligned"
 
     print("\nNEXT:")
-    print("  1. point build_book_tags_hc.py at books_v2_hc2.parquet ->")
-    print("     book_tags_v2_hc2.parquet, and run it")
+    print("  1. run build_book_tags_hc.py (already points at hc4) and")
+    print("     build_content_warnings.py --stage build")
     print("  2. upload embeddings + index FIRST, parquet + tags SECOND")
     print("  3. flip B_EMB / B_FAISS / B_CORPUS / B_TAGS LAST")
     print("  4. re-run eval_goodbooks (baseline: recall@20 0.016, scoring protocol)")

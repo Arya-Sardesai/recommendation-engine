@@ -18,7 +18,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
-import space_ranker as sr  # noqa: E402
+import src.space_ranker as sr  # noqa: E402
 
 CONFIGS = [
     ("old (floor off, idf off)", {"neg_floor_k": 0, "tag_idf": 0.0}),

@@ -66,11 +66,14 @@ TAG_SOURCES = [
     # the warning below fires -- the exact silent gap that left the 20
     # rescued books untagged the first time.
     RAW_DIR / "sweep_raw.jsonl",
+    # the November merge (merge_new_books.py): Google-blurb books and award
+    # books. Their records are copied here so they are tagged like the rest.
+    RAW_DIR / "merge_v4_raw.jsonl",
 ]
 
 PROCESSED = Path("data/processed")
-CORPUS = PROCESSED / "books_v2_hc3.parquet"
-OUT = PROCESSED / "book_tags_v2_hc3.parquet"
+CORPUS = PROCESSED / "books_v2_hc4.parquet"     # Nov 2026 merge; was hc3
+OUT = PROCESSED / "book_tags_v2_hc4.parquet"
 
 USE_CATEGORIES = ("Genre", "Mood")   # not "Tag" (noisy) or "Content Warning"
 MIN_COUNT = 1            # a tag one person applied is not evidence

@@ -125,6 +125,42 @@ def corpus_ids():
     return {re.sub(r"^hc_", "", i) for i in ids}
 
 
+def corpus_by_surname():
+    """surname -> [catalogue titles]. For the looser duplicate check: the award
+    list's own check compares the title before any colon plus the full author
+    key, so "Babel" (R.F. Kuang, on Wikidata) missed "Babel, or The Necessity
+    of Violence" by "R.F. Kuang" already in the catalogue."""
+    if not CORPUS.exists():
+        return {}
+    import pandas as pd
+    c = pd.read_parquet(CORPUS, columns=["title", "primary_author"])
+    out = defaultdict(list)
+    for t, a in zip(c["title"].astype(str), c["primary_author"].astype(str)):
+        sn = ag.surname(a)
+        if sn:
+            out[sn].append(t)
+    return out
+
+
+def in_catalogue(by_sn, titles, author):
+    """Same surname + any title matching by the audit rules, or one title
+    starting the other ("Babel" / "Babel, or The Necessity of Violence")."""
+    have = by_sn.get(ag.surname(author), [])
+    for t in titles:
+        if not t:
+            continue
+        tf, _, _ = ag.title_parts(t)
+        for ct in have:
+            cf, _, _ = ag.title_parts(ct)
+            if ag.title_match(t, {"title": ct}) or ag.title_match(ct, {"title": t}):
+                return ct
+            short, long_ = sorted((tf, cf), key=len)
+            if len(short.split()) >= 1 and len(short) >= 4 and long_.startswith(short + " "):
+                if re.match(r"(or|and|a|an|the)\b", long_[len(short):].strip()) or "," in ct:
+                    return ct
+    return None
+
+
 def credited_author(book, target_author):
     """Hardcover lists every contributor, narrators and translators included,
     and not always the writer first ('Song of Time' came back under its
@@ -423,10 +459,11 @@ def stage_report():
     hc = {r["key"]: r for r in load_jsonl(HC_OUT)}
     gb = {r["key"]: r for r in load_jsonl(GB_OUT)}
     have = corpus_ids()
+    by_sn = corpus_by_surname()
     if not hc:
         sys.exit("run --stage hardcover first")
 
-    rows, outcome, hc_why = [], {}, Counter()
+    rows, outcome, hc_why, dups = [], {}, Counter(), []
     for t in tg:
         k = key_of(t)
         h = hc.get(k)
@@ -436,6 +473,12 @@ def stage_report():
         book = h["book"] if h["status"] == "found" else None
         if book and str(book.get("id")) in have:
             outcome[k] = "already in catalogue (other title)"
+            continue
+        dup = in_catalogue(by_sn, [t["title"], (book or {}).get("title")],
+                           credited_author(book, t["author"]) if book else t["author"])
+        if dup:
+            outcome[k] = "already in catalogue (other title)"
+            dups.append((t["title"], dup))
             continue
         blurb, src = None, None
         if book:
@@ -491,6 +534,9 @@ def stage_report():
     if hc_why:
         print("  (found on Hardcover but its blurb unusable: "
               + ", ".join(f"{k} {v:,}" for k, v in hc_why.most_common()) + ")")
+    if dups:
+        print(f"  ({len(dups):,} caught by the looser title check, e.g. "
+              + "; ".join(f"{a} = {b}" for a, b in dups[:4]) + ")")
     print(f"\n  ready to add: {len(rows):,}  ({ag.pct(len(rows), n)})  -> {LOOKUP}")
 
     per = defaultdict(lambda: [0, 0, 0])

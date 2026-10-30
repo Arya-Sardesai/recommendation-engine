@@ -27,7 +27,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
 
-import space_ranker as sr  # noqa: E402
+import src.space_ranker as sr  # noqa: E402
 from agent_common import check_faithfulness, titles_from_result  # noqa: E402
 
 MODULES = {"book": "agent", "movie": "agent_movies", "tv": "agent_tv"}
